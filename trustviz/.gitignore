@@ -1,0 +1,77 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.so
+*.egg
+*.egg-info/
+.eggs/
+build/
+dist/
+.wheelhouse/
+.python-version
+
+# Virtual envs
+.venv/
+venv/
+env/
+
+# Tooling caches / coverage
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.nox/
+.coverage*
+coverage.xml
+htmlcov/
+
+# Notebooks & temp data
+.ipynb_checkpoints/
+data/
+datasets/
+samples/
+tmp/
+cache/
+*.cache
+
+# Logs
+logs/
+*.log
+
+# Env & secrets
+.env
+.env.*
+*.pem
+*.key
+
+# Plotly/Misc exports
+*.png
+*.jpg
+*.pdf
+*.svg
+
+# Manim (if used later)
+media/
+manim/
+**/media/
+**/videos/
+**/images/
+
+# Editors/OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Frontend (future)
+node_modules/
+.yarn/
+npm-debug.log*
+pnpm-lock.yaml
+yarn.lock
+package-lock.json
+.next/
+.out/
+.vite/
+.turbo/
+.cache/
