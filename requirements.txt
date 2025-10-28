@@ -1,0 +1,5 @@
+google-generativeai>=0.7
+python-dotenv>=1.0
+jupyter_client>=8.6
+pyzmq>=25
+tornado>=6.4

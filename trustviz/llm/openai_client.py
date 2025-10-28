@@ -1,14 +1,31 @@
 # trustviz/llm/openai_client.py
 import os
-from openai import OpenAI
-from dotenv import load_dotenv, find_dotenv
 
+try:
+    from openai import OpenAI
+except Exception as e:  # pragma: no cover
+    raise RuntimeError(
+        "The OpenAI Python SDK is missing or too old. "
+        "Run:  pip install -U openai"
+    ) from e
+
+_client = None
+
+def get_openai_client() -> OpenAI:
+    """Return a singleton OpenAI client. Requires OPENAI_API_KEY in env."""
+    global _client
+    if _client is not None:
+        return _client
+
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        raise RuntimeError("OPENAI_API_KEY is not set in your environment (.env).")
+
+    _client = OpenAI(api_key=api_key)  # SDK 1.x reads env too; passing explicitly is fine
+    return _client
+
+# Backward-compat alias so existing imports keep working
 def get_client() -> OpenAI:
-    # Always (re)load .env so this works from scripts, tests, server, etc.
-    load_dotenv(find_dotenv())
+    return get_openai_client()
 
-    key = os.environ.get("OPENAI_API_KEY")
-    if not key or not key.startswith("sk-"):
-        # Keep the message precise but safe (don't print the key)
-        raise RuntimeError(f"OPENAI_API_KEY not set or malformed; visible={bool(key)}")
-    return OpenAI(api_key=key)
+__all__ = ["get_openai_client", "get_client"]
