@@ -1,1302 +1,622 @@
-# trustviz/server/studio_routes.py — Studio routes + UI (diagram-first with fallbacks)
+# trustviz/server/studio_routes.py — ScholarViz (compact + sources + fixed ask)
 
-import os, re, json, html, traceback, hashlib, math
-from typing import Tuple, List
-from fastapi import APIRouter, Query, Request, Body
-from fastapi.responses import HTMLResponse, PlainTextResponse, JSONResponse
+import os, re, io, json, html, base64, datetime
+from typing import List
+from fastapi import APIRouter, Body, UploadFile, File, Request, Query
+from fastapi.responses import HTMLResponse, JSONResponse
+from pypdf import PdfReader
+import httpx
 
-# Verifiers/adapters (deterministic, fast)
-from trustviz.svl.bar_verify import verify_bar
-from trustviz.svl.pie_verify import verify_pie
-from trustviz.svl.line_verify import verify_line
-from trustviz.svl.graph_verify import KnowledgeGraphSpec, verify_kg
-from trustviz.ve.graph_adapter import kg_cyto_payload
-
-# LLM adapters (Gemini-backed)
-from trustviz.llm.chart_llm import get_chart_spec_from_text, get_chart_walkthrough
-from trustviz.llm.kg_llm import get_llm_kg_walkthrough
-from trustviz.llm.diagram_llm import get_diagram_walkthrough
-
-# Optional notebook helper (for server-side validation run)
+from trustviz.llm.gemini_client import gen_text, gen_json
 from trustviz.notebook.runner import NotebookRunner
-from trustviz.llm.gemini_client import gen_json  # used for captions and Lab explanations
-from fastapi.responses import Response
-from trustviz.ai.edu_charts import render_chart_png
+
 router = APIRouter()
-
-# ------------------------- Globals / Config -------------------------
 MODEL = os.environ.get("TRUSTVIZ_LLM_MODEL", "gemini-2.5-pro")
-_EXPLAIN_RULES = (
-  "You must return a single JSON object with EXACTLY these keys:\n"
-  "intro, what_you_see, how_it_works, why_it_matters, callouts, glossary\n"
-  "- intro: 2–3 sentences beginner-friendly (min 50 words).\n"
-  "- what_you_see: 1 paragraph naming 3–5 boxes/arrows by label (min 70 words).\n"
-  "- how_it_works: 1 paragraph mapping controls to stages (min 90 words).\n"
-  "- why_it_matters: 1 paragraph tied to SOC/audits/outcomes (min 70 words).\n"
-  "- callouts: ordered list of 3–6 bullets, each '<Label>: takeaway'.\n"
-  "- glossary: 3–6 objects {'term': .., 'def': ..} (11–25 words each).\n"
-  "Rules: defense-only; no offensive procedures. Prefer exact diagram labels. No filler."
-)
 
-# LLM rule for Lab explanations
-_EXPLAIN_ARTIFACTS_RULES = (
-  "Write one short, student-friendly explanation (plain text, no JSON).\n"
-  "Start with a one-sentence summary of the flow.\n"
-  "Then explain each verdict plainly and suggest one concrete fix per issue.\n"
-  "If verdicts == ['OK'], give one tip to strengthen the model anyway.\n"
-  "Keep it defense-only; do not include any offensive/operational steps."
-)
-
-# LLM rule for the optional “Ask about this diagram”
-_ASK_RULES = (
-  "Defense-only tutoring. Use exact diagram labels when helpful.\n"
-  "Answer concisely (<=170 words). If the question is vague, briefly say what the diagram shows first,\n"
-  "then give 2–4 concrete insights or next steps a defender should consider.\n"
-  "Never provide offensive instructions."
-)
-
-_FUNC = r"(sin|cos|tan|exp|log|sqrt)"
-PI_ALIASES = {"π": math.pi, "pi": math.pi}
-
-# Show/hide the Notebook “Learning Lab” box in the UI
-SHOW_LAB = True
-
-# Course-topic presets (Google Cybersecurity cert-aligned prompts)
-TOPIC_PRESETS = {
-  "Foundations": "Explain the CIA triad and give a high-level security lifecycle diagram.",
-  "Linux & Sysadmin": "Show the Linux auth flow and where logs land; add controls.",
-  "Networking": "Layered model (L2–L7) and common controls at each layer.",
-  "Security Tools & SIEM": "End-to-end log pipeline to SIEM with detections and triage steps.",
-  "Threat Modeling (ATVR)": "Identify assets, threats, vulns, and controls; show a risk path.",
-  "Incident Response": "NIST IR lifecycle with defender actions and artifacts at each phase.",
-  "Access Management": "MFA + SSO + least privilege + token risks and mitigations.",
-  "Cloud Security": "Public bucket misconfig to exfil path with cloud-native controls.",
-}
-
-# --------------------------- Safety & Reframe ---------------------------
-_DENYLIST = [
-    r"\b(ddos|dos)\b", r"\b(botnet|c2|command\s*and\s*control)\b",
-    r"\b(keylogger|rootkit|rat)\b", r"\bzero[-\s]?day\b",
-    r"\bexploit\s+code\b", r"\bcredential\s+stuffing\b",
-    r"\bphishing\s+kit\b", r"\bpassword\s*cracker\b",
-    r"\bport\s*scan\s*(script|code)\b", r"\bsql\s*injection\s*(payload|exploit)\b",
-    r"\bbypass\s+mfa\b", r"\breal\s+bank\s+site\b",
+# ---------- safety ----------
+_DENY = [
+  r"\b(ddos|dos)\b", r"\b(botnet|c2|command\s*and\s*control)\b", r"\b(keylogger|rootkit|rat)\b",
+  r"\bzero[-\s]?day\b", r"\bexploit\s+code\b", r"\bcredential\s+stuffing\b", r"\bphishing\s+kit\b",
+  r"\bpassword\s*cracker\b", r"\bport\s*scan\s*(script|code)\b", r"\bsql\s*injection\s*(payload|exploit)\b",
+  r"\bbypass\s+mfa\b", r"\breal\s+bank\s+site\b", r"\bhow\s+to\s+(hack|bypass)\b", r"\bbypass\b", r"\bhack(?:ing)?\b"
 ]
-def _is_risky(text: str) -> bool:
-    s = (text or "").lower()
-    return any(re.search(p, s) for p in _DENYLIST)
+def _risky(s:str)->bool: return any(re.search(p,(s or "").lower()) for p in _DENY)
 
-def _defensive_reframe(text: str):
-    return (
-        "This view is reframed for safety and education only. It shows common attack paths and where defenders can stop them—no procedural details.",
-        {"reframed": True, "reason": "operational/sensitive intent"}
-    )
-
-# --------------------------- Intent routing ---------------------------
-_MATH_PAT = re.compile(r"(?:^|\s)(draw|plot|visualize)\s+|^y\s*=|^f\s*\(\s*x\s*\)\s*=", re.I)
-def _looks_like_function(text: str) -> bool:
-    s = text or ""
-    return bool(_MATH_PAT.search(s)) and ("x" in s or "y" in s or "f(" in s)
-
-def _looks_like_roc(text: str) -> bool:
-    s = (text or "").lower()
-    return (" roc" in s) or ("auc" in s) or ("positives" in s and "negatives" in s)
-
-def _route_intent(q: str) -> str:
-    s = (q or "").lower()
-    if any(k in s for k in ["knowledge graph", "attack graph", "attack-graph", "graph of", "graph:"]):
-        return "graph"
-    if _looks_like_roc(s): return "roc"
-    if any(t in s for t in ["how ", "why ", "happen", "steps", "process", "flow", "lifecycle", "kill chain"]):
-        return "diagram"
-    if _looks_like_function(q) or any(k in s for k in ["bar", "pie", "line", "plot", "chart", "histogram", "draw"]):
-        return "chart"
-    return "diagram"
-
-# ------------------------- Topic mapping (extend over time) -------------------------
-def _topic_for(q: str) -> str:
-    s = (q or "").lower()
-    if "phish" in s: return "phishing"
-    if "cia triad" in s or ("confidentiality" in s and "integrity" in s and "availability" in s): return "cia"
-    if "risk" in s and "triage" in s: return "risk"
-    if "zero trust" in s or "zero-trust" in s: return "zerotrust"
-    if any(k in s for k in ["oauth", "token"]): return "oauth"
-    if any(k in s for k in ["cloud", "s3", "bucket", "misconfig"]): return "cloud"
-    if any(k in s for k in ["supply", "sbom", "software supply"]): return "supply"
-    return "breach"
-
-# ------------------------- Mermaid safety -------------------------
 _ALLOWED = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789[]()_:.-> \n|/%'\",+&?-")
-def _sanitize_mermaid(s: str) -> str:
-    return "".join(ch for ch in (s or "") if ch in _ALLOWED)
+def _sanitize_mermaid(s:str)->str: return "".join(ch for ch in (s or "") if ch in _ALLOWED)
 
-def _default_mermaid(title: str = "Security Lifecycle") -> str:
-    return (
-      "flowchart LR\n"
-      "  A[Ask a security question] --> B[Conceptual diagram]\n"
-      "  B --> C[Key defensive controls]\n"
-      "  C --> D[Safer operations]\n"
-    )
+def _default_mermaid()->str:
+  return ("flowchart LR\n"
+          "  Q[Question] --> D[High-level Diagram]\n"
+          "  D --> K[Key Controls]\n"
+          "  K --> O[Outcomes]\n")
 
-# ------------------------- Diagram helpers -------------------------
-def _bold_terms(text: str, labels: list[str]) -> str:
-    s = html.escape(text or "")
-    phrases = sorted({l.strip() for l in (labels or []) if l}, key=len, reverse=True)
-    for p in phrases:
-        pat = re.compile(rf"\b{re.escape(p)}\b", re.IGNORECASE)
-        s = pat.sub(lambda m: f"<strong>{html.escape(m.group(0))}</strong>", s)
-    return s
+# ---------- sources (OpenAlex) ----------
+async def _scholar_search(q:str, per:int=5)->List[dict]:
+  now = datetime.date.today()
+  start = f"{now.year-3}-01-01"
+  url = "https://api.openalex.org/works"
+  params = {
+    "search": q,
+    "filter": f"from_publication_date:{start},language:en,primary_location.source.type:journal",
+    "sort": "publication_date:desc",
+    "per_page": per
+  }
+  try:
+    async with httpx.AsyncClient(timeout=12.0) as hx:
+      r = await hx.get(url, params=params)
+      r.raise_for_status()
+      data = r.json().get("results", [])
+  except Exception:
+    return []
+  out = []
+  for w in data:
+    out.append({
+      "title": w.get("title") or "(untitled)",
+      "year": (w.get("publication_year") or ""),
+      "venue": (w.get("primary_location",{}).get("source",{}) or {}).get("display_name"),
+      "url": (w.get("primary_location",{}) or {}).get("landing_page_url") or w.get("open_access",{}).get("oa_url") or w.get("id"),
+      "authors": ", ".join(a.get("author",{}).get("display_name","") for a in (w.get("authorships") or [])[:4])
+    })
+  return out
 
-def _chart_spec_to_plotly(chart: dict) -> dict:
-    kind = (chart or {}).get("kind")
-    title = chart.get("title") or ""
-    if kind == "pie":
-        return {"data":[{"type":"pie","labels":chart.get("labels",[]),"values":chart.get("values",[])}],
-                "layout":{"title":title}}
-    if kind == "bar":
-        return {"data":[{"type":"bar","x":chart.get("x",[]),"y":chart.get("y",[])}],
-                "layout":{"title":title,"yaxis":{"title":chart.get("y_label") or "Value"}}}
-    if kind == "line":
-        return {"data":[{"type":"scatter","mode":"lines","x":chart.get("x",[]),"y":chart.get("y",[])}],
-                "layout":{"title":title,"xaxis":{"title":chart.get("x_label") or "x"},
-                                      "yaxis":{"title":chart.get("y_label") or "y"}}}
-    return {"data":[], "layout":{"title": title or "Chart"}}
+def _labels_from_mermaid(src:str)->List[str]:
+  labs, seen = [], set()
+  for m in re.finditer(r"\b[A-Za-z0-9_]+\s*[\[\(]([^\]\)]+)[\]\)]", src or ""):
+    t = m.group(1).strip()
+    if t and t not in seen: seen.add(t); labs.append(t)
+  return labs[:20]
 
-def _mermaid_template(kind: str) -> str:
-    if kind == "breach":
-        return """
-flowchart LR
-  A[Recon] --> B[Initial Access]
-  B --> C[Privilege Escalation & Lateral Movement]
-  C --> D[Data Discovery & Collection]
-  D --> E[Exfiltration]
-  E --> F[Monetization / Impact]
-  D1[[MFA]] -.-> B
-  D2[[EDR/AV]] -.-> C
-  D3[[DLP]] -.-> D
-  D4[[Egress Monitor]] -.-> E
-""".strip()
-    if kind == "phishing":
-        return """
-flowchart LR
-  P1[Recon/Targeting] --> P2[Phish Email/SMS]
-  P2 --> P3[User Interaction]
-  P3 --> P4[Token/Cred Steal]
-  P4 --> P5[Initial Access]
-  P5 --> P6[Lateral Movement]
-  P6 --> P7[Data Access/Exfil]
-  D1[[Email Filter + DMARC]] -.-> P2
-  D2[[MFA/Phishing-Resistant]] -.-> P3
-  D3[[EDR/Least Privilege]] -.-> P5
-  D4[[DLP/Egress Monitor]] -.-> P7
-""".strip()
-    if kind == "supply":
-        return """
-flowchart LR
-  S1[Compromise Vendor/Build] --> S2[Malicious Update]
-  S2 --> S3[Customer Deployment]
-  S3 --> S4[Privilege Escalation]
-  S4 --> S5[Lateral Movement/Data]
-  D1[[Code Signing/Verify]] -.-> S2
-  D2[[Allow-List/Runtime Monitor]] -.-> S3
-  D3[[Segmentation/EDR]] -.-> S4
-""".strip()
-    if kind == "cloud":
-        return """
-flowchart LR
-  C1[Public Bucket/Misconfig] --> C2[Unauth Access]
-  C2 --> C3[Data Enumeration]
-  C3 --> C4[Bulk Download]
-  C4 --> C5[Monetization/Leak]
-  D1[[IAM Least Privilege]] -.-> C2
-  D2[[Block Public Access]] -.-> C1
-  D3[[DLP/Object Lock]] -.-> C4
-""".strip()
-    if kind == "oauth":
-        return """
-flowchart LR
-  O1[Phish/OAuth Consent] --> O2[Token Issued]
-  O2 --> O3[Token Theft/Replay]
-  O3 --> O4[API/Data Access]
-  D1[[PKCE/Bound Tokens]] -.-> O2
-  D2[[Short TTL/Rotation]] -.-> O3
-  D3[[Anomaly Detection]] -.-> O4
-""".strip()
-    if kind == "zerotrust":
-        return """
-flowchart LR
-  Z1[Request] --> Z2[Policy: Identity+Device+Context]
-  Z2 --> Z3[Grant with Least Priv]
-  Z3 --> Z4[Continuous Verify]
-  Z4 --> Z5[Re-evaluate/Block]
-  D1[[MFA/Device Posture/Network Microseg]] -.-> Z2
-""".strip()
-    if kind == "auth_mfa":
-        return """
-flowchart LR
-  A[User Sign-in] --> B[MFA Challenge]
-  B -->|consent fatigue/phish| C[Token Theft/Replay]
-  B -->|SIM swap/OTP intercept| D[OTP Compromise]
-  C --> E[Session Access]
-  D --> E
-  E --> F[Lateral Movement/Data]
-  D1[[FIDO2/WebAuthn]] -.-> B
-  D2[[Number matching / rate limits]] -.-> B
-  D3[[Token binding / short TTL / rotation]] -.-> C
-  D4[[Device posture + EDR]] -.-> E
-  D5[[Anomaly detection / CA policies]] -.-> E
-""".strip()
-    return _default_mermaid()
-
-_KNOWN_KINDS = {"breach","phishing","supply","cloud","oauth","zerotrust","auth_mfa"}
-
-def _diagram_for(q: str) -> dict:
-    kind = _topic_for(q)
-    base = _mermaid_template(kind) if kind in _KNOWN_KINDS else _default_mermaid()
-    mermaid = _sanitize_mermaid(base)
-    spec = {
-        "nodes": [{"id":"A","label":"Recon"},{"id":"B","label":"Initial Access"}],
-        "edges": [["A","B", {"label":"progression"}]],
-        "defenses": [{"attachTo":"B","label":"MFA"}],
-    }
-    return {"mode": "diagram", "mermaid": mermaid, "bullets": [kind], "spec": spec}
-
-# ------------------------- Small parsers -------------------------
-_PAIR_SPLIT = re.compile(r"[;,]\s*")
-def _parse_pairs(text: str):
-    labels, vals = [], []
-    for tok in _PAIR_SPLIT.split(text.strip()):
-        if not tok: continue
-        piece = tok.rsplit(":", 1)[-1].strip()
-        m = re.match(r"(.*?\S)\s+(-?\d+(?:\.\d+)?)\s*$", piece)
-        if m:
-            labels.append(m.group(1).strip()); vals.append(float(m.group(2)))
-    return labels, vals
-
-_RANGE_RE = re.compile(r"\[\s*([^\],]+)\s*,\s*([^\],]+)\s*\]")
-def _parse_range(text: str) -> Tuple[float, float] | None:
-    m = _RANGE_RE.search(text)
-    if not m: return None
-    def num(s: str) -> float:
-        s = s.strip().lower().replace("−", "-")
-        for k, v in PI_ALIASES.items(): s = s.replace(k, str(v))
-        return float(eval(s, {"__builtins__": {}}, {"pi": math.pi}))
-    return num(m.group(1)), num(m.group(2))
-
-_PARAM_RE = re.compile(r"([A-Za-z])\s*=\s*([-+]?\d+(?:\.\d+)?)")
-def _apply_params(expr: str, text: str) -> str:
-    params = {m.group(1): m.group(2) for m in _PARAM_RE.finditer(text)}
-    for k, v in params.items(): expr = re.sub(rf"\b{k}\b", v, expr)
-    return expr
-
-def _normalize_expr(expr: str) -> str:
-    s = (expr or "").strip()
-    s = re.sub(r'^\s*(draw|plot|graph|visualize|compute)\s+', '', s, flags=re.I)
-    s = re.sub(r'^\s*y\s*=\s*', '', s, flags=re.I)
-    s = re.sub(r'^\s*f\s*\(\s*x\s*\)\s*=\s*', '', s, flags=re.I)
-    s = _apply_params(s, expr)
-    s = s.replace("^", "**")
-    s = re.sub(rf"\b{_FUNC}\s*x\b", r"\1(x)", s, flags=re.I)
-    s = re.sub(rf"(\d)\s*({_FUNC})\b", r"\1*\2", s, flags=re.I)
-    s = re.sub(r"(\d)\s*x\b", r"\1*x", s)
-    s = re.sub(r"\bx\s*(\d)", r"x*\1", s)
-    s = re.sub(r"\bx\s*\(", "x*(", s)
-    s = re.sub(r"\)\s*x\b", ")*x", s)
-    s = re.sub(r"\s+", "", s)
-    return s
-
-def _sample_function(expr: str, xmin=-5.0, xmax=5.0, n=600):
-    import math as _m
-    env = {"sin": _m.sin, "cos": _m.cos, "tan": _m.tan, "exp": _m.exp, "log": _m.log,
-           "sqrt": _m.sqrt, "abs": abs, "pi": _m.pi, "e": _m.e}
-    s = _normalize_expr(expr)
-    xs, ys = [], []
-    step = (xmax - xmin) / max(n - 1, 1)
-    for i in range(n):
-        x = xmin + i * step
-        env["x"] = x
-        try:
-            y = eval(s, {"__builtins__": {}}, env)
-            if isinstance(y, (int, float)) and _m.isfinite(y):
-                xs.append(float(x)); ys.append(float(y))
-        except Exception:
-            continue
-    if len(xs) < 10:
-        raise ValueError(f"Not enough valid samples to plot “{expr}”. Try a different range.")
-    return {
-        "data": [{"type": "scatter", "mode": "lines", "x": xs, "y": ys, "name": f"y = {s}"}],
-        "layout": {"title": f"y = {s}", "xaxis": {"title": "x"}, "yaxis": {"title": "y"}}
-    }
-
-# ------------------------- ROC helper -------------------------
-def _roc_from_lists(pos: List[float], neg: List[float]):
-    try:
-        from sklearn.metrics import roc_curve, auc
-        import numpy as np
-        y_true = np.array([1]*len(pos) + [0]*len(neg))
-        y_score = np.array(pos + neg)
-        fpr, tpr, _ = roc_curve(y_true, y_score)
-        A = float(auc(fpr, tpr))
-        return {"data": [{"type":"scatter","mode":"lines","x":fpr.tolist(),"y":tpr.tolist(),"name":"ROC"}],
-                "layout":{"title":f"ROC (AUC={A:.3f})","xaxis":{"title":"FPR"},"yaxis":{"title":"TPR"}}}, A
-    except Exception:
-        N = len(pos)*len(neg)
-        if N == 0: raise ValueError("Need positives and negatives.")
-        greater = sum(1 for p in pos for n in neg if p > n)
-        equal = sum(1 for p in pos for n in neg if p == n)
-        auc_val = (greater + 0.5*equal) / N
-        pts = sorted([(p,1) for p in pos] + [(n,0) for n in neg], key=lambda x: -x[0])
-        tp = fp = 0; P=len(pos); Nn=len(neg)
-        xs=[0.0]; ys=[0.0]
-        for _,y in pts:
-            tp += (y==1); fp += (y==0)
-            xs.append(fp/max(Nn,1)); ys.append(tp/max(P,1))
-        return {"data":[{"type":"scatter","mode":"lines","x":xs,"y":ys,"name":"ROC"}],
-                "layout":{"title":f"ROC (AUC≈{auc_val:.3f})","xaxis":{"title":"FPR"},"yaxis":{"title":"TPR"}}}, auc_val
-
-def _parse_roc(text: str) -> Tuple[List[float], List[float]]:
-    ps = re.search(r"positives?\s*([0-9\.,\s-]+)", text, re.I)
-    ns = re.search(r"negatives?\s*([0-9\.,\s-]+)", text, re.I)
-    if not (ps and ns): raise ValueError("Provide 'positives ...; negatives ...' lists.")
-    P = [float(x) for x in re.split(r"[,\s]+", ps.group(1).strip()) if x]
-    N = [float(x) for x in re.split(r"[,\s]+", ns.group(1).strip()) if x]
-    return P, N
-
-# ------------------------- Notebook validation helper -------------------------
-import json as _json_mod
-def _validate_flow_spec(spec: dict) -> dict:
-    """Returns artifacts like {'checks': {...}, 'verdicts': [...]} via Notebook runner."""
-    cells = [f"""
-import json, networkx as nx
-ARTIFACTS['checks'] = {{}}
-spec = json.loads('''{_json_mod.dumps(spec)}''')
-G = nx.DiGraph()
-for n in spec.get('nodes', []): G.add_node(n.get('id'))
-for e in spec.get('edges', []):
-    if isinstance(e, (list,tuple)) and len(e)>=2: G.add_edge(e[0], e[1])
-checks = ARTIFACTS['checks']
-checks['node_count'] = G.number_of_nodes()
-checks['edge_count'] = G.number_of_edges()
-checks['is_dag'] = nx.is_directed_acyclic_graph(G)
-checks['isolated_nodes'] = [n for n in G.nodes() if G.degree(n)==0]
-checks['defense_count'] = len(spec.get('defenses', []) or [])
-verdicts = []
-if not checks['is_dag']: verdicts.append('Flow contains cycles; remove back-edges.')
-if checks['defense_count'] == 0: verdicts.append('No defensive controls attached.')
-if checks['isolated_nodes']: verdicts.append('Isolated nodes: ' + json.dumps(checks["isolated_nodes"][:5]))
-ARTIFACTS['verdicts'] = verdicts or ['OK']
-"""]
-    runner = NotebookRunner(timeout_s=6)
-    try:
-        res = runner.run(cells)
-        return res.artifacts or {}
-    finally:
-        runner.stop()
-
-# ------------------------- Provenance & helpers -------------------------
-def _prov(q: str, svl: str, extra: dict | None = None) -> dict:
-    h = hashlib.sha256((q or "").encode("utf-8")).hexdigest()[:16]
-    out = {"inputs_hash": h, "svl_decision": svl}
-    if extra: out.update(extra)
-    return out
-
-def _labels_from_mermaid(src: str) -> list[str]:
-    labs = []
-    for m in re.finditer(r"\b[A-Za-z0-9_]+\s*[\[\(]([^\]\)]+)[\]\)]", src or ""):
-        t = m.group(1).strip()
-        if t and t.lower() not in {"defensive_controls"}:
-            labs.append(t)
-    out, seen = [], set()
-    for t in labs:
-        if t not in seen:
-            seen.add(t); out.append(t)
-    return out
-
-def _auto_explain(kind: str, labels: list[str]) -> dict:
-    defaults = {
-        "breach": ["Recon","Initial Access","Privilege Escalation & Lateral Movement",
-                   "Data Discovery & Collection","Exfiltration","Monetization / Impact"],
-        "phishing": ["Phish Email/SMS","User Interaction","Token/Cred Steal",
-                     "Initial Access","Lateral Movement","Data Access/Exfil"],
-        "cloud": ["Public Bucket/Misconfig","Unauth Access","Data Enumeration","Bulk Download"],
-        "oauth": ["OAuth Consent","Token Issued","Token Theft/Replay","API/Data Access"],
-        "supply": ["Compromise Vendor/Build","Malicious Update","Customer Deployment",
-                   "Privilege Escalation","Lateral Movement/Data"],
-        "zerotrust": ["Request","Policy: Identity+Device+Context","Grant with Least Priv",
-                      "Continuous Verify","Re-evaluate/Block"],
-    }.get(kind, [])
-    names = [n for n in defaults if n in labels] or (labels[:6] or ["Stage A","Stage B","Stage C"])
-    intro = ("This diagram summarizes a common security scenario and where layered controls interrupt risk. "
-             "It helps learners map phases to the exact points where detections and policies have leverage.")
-    what = (f"You are seeing a left-to-right flow. Typical stages include {', '.join(names[:3])}"
-            + (", and " + names[3] if len(names) > 3 else "")
-            + ". Dashed connectors indicate where controls attach to stop progression.")
-    how = (f"The flow begins at {names[0]} and proceeds through "
-           f"{', '.join(names[1:max(2,len(names)//2)])}. Controls reduce either the chance of the next step or "
-           "the impact if it occurs. MFA hardens Initial Access; EDR/AV constrains escalation; DLP limits sensitive "
-           "collection from turning into Exfiltration; egress monitoring spots late-stage anomalies.")
-    why = ("This matters because incidents unfold along these stages in tickets and logs. Aligning detections and "
-           "playbooks to each stage shortens time-to-detect and time-to-contain—key audit and executive metrics.")
-    callouts = [
-        f"{names[0]}: define early telemetry to catch targeting or scanning.",
-        f"{names[1] if len(names)>1 else 'Initial Access'}: enforce phishing-resistant MFA.",
-        f"{names[2] if len(names)>2 else 'Privilege Escalation'}: apply least privilege and monitor elevation.",
-        f"{names[3] if len(names)>3 else 'Data Discovery & Collection'}: tag sensitive data and enable DLP.",
-    ]
-    glossary = [
-        {"term":"MFA","def":"A second factor that verifies identity to prevent easy account takeover."},
-        {"term":"EDR","def":"Host-level detection/response to spot and contain malicious activity."},
-        {"term":"DLP","def":"Policies that monitor and block sensitive data leaving the environment."},
-    ]
-    return {"intro": intro, "what_you_see": what, "how_it_works": how,
-            "why_it_matters": why, "callouts": callouts, "glossary": glossary}
-
-def _to_text(x):
-    """Coerce any value to a short, safe text for html.escape."""
-    if isinstance(x, str):
-        return x
-    try:
-        return json.dumps(x, ensure_ascii=False)
-    except Exception:
-        return str(x)
-
-# ------------------------------ API: Learning Lab ------------------------------
-@router.post("/lab/validate")
-def lab_validate(spec: dict = Body(...)):
-    """Run the server-side notebook to validate a diagram spec and return artifacts."""
-    try:
-        artifacts = _validate_flow_spec(spec or {})
-        return JSONResponse({"ok": True, "artifacts": artifacts})
-    except Exception as e:
-        return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
-
-@router.post("/lab/explain")
-def lab_explain(payload: dict = Body(...)):
-    """Use the LLM to explain notebook validation artifacts in plain language."""
-    spec = (payload or {}).get("spec") or {}
-    user_q = (payload or {}).get("q") or ""
-    try:
-        artifacts = _validate_flow_spec(spec)
-    except Exception as e:
-        return JSONResponse({"ok": False, "error": f"validate: {e}"}, status_code=400)
-
-    labels = [n.get("label","") for n in (spec.get("nodes") or []) if n.get("label")]
-    try:
-        user = (
-            "Diagram labels you may reference: " + ", ".join(labels[:12]) + "\n"
-            "Validation artifacts JSON:\n" + json.dumps(artifacts) + "\n"
-            f"Student question/focus (optional): {user_q}\n"
-        )
-        text = gen_json(_EXPLAIN_ARTIFACTS_RULES, user, model=MODEL)
-        if isinstance(text, dict):
-            text = json.dumps(text, ensure_ascii=False)
-        return JSONResponse({"ok": True, "artifacts": artifacts, "explanation": text})
-    except Exception as e:
-        return JSONResponse({"ok": False, "error": f"llm: {e}"}, status_code=500)
-
-# ------------------------------ API: Optional “Ask about this diagram” --------
-@router.post("/studio/ask")
-def studio_ask(payload: dict = Body(...)):
-    """
-    Accepts { "mermaid": str, "q": str } and returns a defense-only LLM answer.
-    If labels aren't provided, they are auto-extracted from Mermaid.
-    """
-    mer = (payload or {}).get("mermaid") or _default_mermaid()
-    q = (payload or {}).get("q") or ""
-    labels = _labels_from_mermaid(mer)
-    try:
-        user = (
-            "Mermaid diagram source:\n" + mer + "\n\n" +
-            "Diagram labels you may reference verbatim: " + ", ".join(labels[:20]) + "\n" +
-            "Student question:\n" + q
-        )
-        text = gen_json(_ASK_RULES, user, model=MODEL)
-        if isinstance(text, dict):
-            text = json.dumps(text, ensure_ascii=False)
-        return JSONResponse({"ok": True, "answer": text})
-    except Exception as e:
-        return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
-
-# ------------------------------ /studio ---------------------------------------
-@router.get("/edu/chart")
-def edu_chart(kind: str = "activations"):
-    try:
-        png = render_chart_png(kind)
-        return Response(content=png, media_type="image/png")
-    except Exception as e:
-        return Response(content=f"error: {e}", media_type="text/plain", status_code=500)
-@router.get("/studio", response_class=HTMLResponse)
-def studio(
-    request: Request,
-    q: str = Query(
-        "",
-        description="Ask a security 'how/why', a knowledge graph, or a chart/math/ROC request",
-    ),
-):
-    explanation = ""
-    error = "-"
-    fig = None
-    cyto = None
-
-    # Landing
-    if not (q or "").strip():
-        explanation = ("Pick a topic preset or ask a process question for a diagram; "
-                       "type “draw x^2” for a function; or provide positives/negatives for ROC.")
-        return HTMLResponse(_studio_shell(q, explanation, error, fig, cyto, mermaid=None, segments_obj=None))
-
-    # Safety: defense-only fallback
-    if getattr(request.state, "risky", False) or _is_risky(q):
-        intro_text, _provx = _defensive_reframe(q)
-        payload = _diagram_for(q)
-        mer_src = payload.get("mermaid") or _default_mermaid()
-        outro_text = "Notice how controls like MFA, EDR/AV, DLP and Egress monitoring attach to key steps. Follow the arrows to see where defenders can interrupt the path."
-        walk = {
-            "segments": [
-                {"type": "text", "content": intro_text},
-                {"type": "viz", "mode": "diagram", "mermaid": mer_src},
-                {"type": "text", "content": outro_text},
-            ],
-            "labels": []
-        }
-        return HTMLResponse(_studio_shell(q, "Walkthrough with a conceptual diagram.", "-", None, None, mermaid=None, segments_obj=walk))
-
-    # Route intent
-    intent = _route_intent(q)
-
-    try:
-        # -------- Diagram --------
-        if intent == "diagram":
-            payload = _diagram_for(q)
-            mer = payload.get("mermaid") or _default_mermaid()
-            kind = (_topic_for(q) or "breach")
-            labels = _labels_from_mermaid(mer)
-
-            # fallback explanation
-            expl = _auto_explain(kind, labels)
-
-            # try LLM JSON and merge if strong enough
-            try:
-                user = (
-                    f"User prompt: {q}\n"
-                    f"Mermaid diagram source:\n{mer}\n"
-                    f"Diagram labels you MAY reference verbatim: {', '.join(labels) if labels else '(none)'}"
-                )
-                data = gen_json(_EXPLAIN_RULES, user, model=MODEL) or {}
-                def ok_text(s, n=120): return isinstance(s, str) and len(s.strip()) >= n
-                def ok_list(xs, n=3): return isinstance(xs, list) and len(xs) >= n
-                if isinstance(data, dict):
-                    if ok_text(data.get("intro"), 80):          expl["intro"] = data["intro"].strip()
-                    if ok_text(data.get("what_you_see"), 80):   expl["what_you_see"] = data["what_you_see"].strip()
-                    if ok_text(data.get("how_it_works"), 120):  expl["how_it_works"] = data["how_it_works"].strip()
-                    if ok_text(data.get("why_it_matters"), 80): expl["why_it_matters"] = data["why_it_matters"].strip()
-                    if ok_list(data.get("callouts"), 3):        expl["callouts"] = data["callouts"]
-                    if ok_list(data.get("glossary"), 3):        expl["glossary"] = data["glossary"]
-            except Exception:
-                pass
-
-            # render sections, robust to odd shapes
-            def _coerce_callout(x):
-                if isinstance(x, str): return x
-                if isinstance(x, dict):
-                    return x.get("text") or x.get("note") or x.get("label") or x.get("title") \
-                           or (f"{x.get('term','')}: {x.get('def','')}".strip(": ").strip()) \
-                           or json.dumps(x, ensure_ascii=False)
-                return str(x)
-
-            def _glossary_li(g):
-                if isinstance(g, dict):
-                    term = g.get("term") or g.get("label") or "Term"
-                    definition = g.get("def") or g.get("definition") or g.get("text") or ""
-                else:
-                    term, definition = "Term", str(g)
-                return f"<li><strong>{html.escape(term)}:</strong> {html.escape(definition)}</li>"
-
-            callouts_html = "".join(f"<li>{html.escape(_coerce_callout(c))}</li>" for c in (expl.get("callouts") or []))
-            glossary_html = "".join(_glossary_li(g) for g in (expl.get("glossary") or []))
-
-            sections_below = [
-                {"type": "text", "content": f"<h3>What you’re seeing</h3><p>{html.escape(expl['what_you_see'])}</p>"},
-                {"type": "text", "content": f"<h3>How it works</h3><p>{html.escape(expl['how_it_works'])}</p>"},
-                {"type": "text", "content": f"<h3>Why it matters</h3><p>{html.escape(expl['why_it_matters'])}</p>"},
-                {"type": "text", "content": f"<h3>Key callouts</h3><ol>{callouts_html}</ol>"},
-                {"type": "text", "content": f"<h3>Glossary</h3><ul>{glossary_html}</ul>"},
-            ]
-
-            segments = [
-                {"type": "text", "content": html.escape(expl["intro"])},
-                {"type": "viz", "mode": "diagram", "mermaid": mer},
-                *sections_below,
-            ]
-
-            # if Lab on, append server validation verdicts (quick)
-            try:
-                if SHOW_LAB and isinstance(payload.get("spec"), dict):
-                    artifacts = _validate_flow_spec(payload["spec"])
-                    verdicts = artifacts.get("verdicts") or []
-                    if verdicts:
-                        segments.append({"type": "text", "content": "<p><em>Validation:</em> " + html.escape("; ".join(verdicts)) + "</p>"})
-            except Exception:
-                pass
-
-            return HTMLResponse(_studio_shell(
-                q=q,
-                explanation="Walkthrough: rich intro above, detailed caption below the diagram.",
-                error="-", fig_json=None, cyto=None, mermaid=None, segments_obj={"segments": segments}
-            ))
-
-        # -------- Knowledge Graph --------
-        if intent == "graph":
-            walk = get_llm_kg_walkthrough(q, MODEL)
-            return HTMLResponse(_studio_shell(
-                q=q, explanation="Walkthrough with a knowledge graph and short explanations.",
-                error="-", fig_json=None, cyto=None, mermaid=None, segments_obj=walk
-            ))
-
-        # -------- ROC --------
-        if intent == "roc":
-            P, N = _parse_roc(q)
-            fig, auc_val = _roc_from_lists(P, N)
-            explanation = f"ROC computed from your lists. AUC = {auc_val:.3f}."
-            return HTMLResponse(_studio_shell(q, explanation, error="-", fig_json=fig, cyto=None, mermaid=None, segments_obj=None))
-
-        # -------- Charts & Functions --------
-        # 1) story-style walkthrough
-        if intent == "chart":
-            try:
-                walk = get_chart_walkthrough(q, MODEL)
-                if isinstance(walk, dict) and walk.get("segments"):
-                    return HTMLResponse(_studio_shell(
-                        q=q, explanation="Walkthrough with interleaved explanations and charts.",
-                        error="-", fig_json=None, cyto=None, mermaid=None, segments_obj=walk
-                    ))
-            except Exception:
-                pass
-
-        # 2) function fallback
-        if _looks_like_function(q):
-            rng = _parse_range(q) or (-5.0, 5.0)
-            fig = _sample_function(q, xmin=rng[0], xmax=rng[1], n=600)
-            explanation = "Function plotted with a safe sampler. Adjust range below."
-            return HTMLResponse(_studio_shell(q, explanation, error="-", fig_json=fig, cyto=None, mermaid=None, segments_obj=None))
-
-        # 3) inline bar/pie parsing
-        labels, vals = _parse_pairs(q)
-        qs = (q or "").lower()
-        if labels and vals:
-            if "pie" in qs:
-                if any(v < 0 for v in vals):
-                    explanation = "Blocked: pie slices can’t be negative."
-                    return HTMLResponse(_studio_shell(q, explanation, error="-", fig_json=None, cyto=None, mermaid=None, segments_obj=None))
-                fig = {"data":[{"type":"pie","labels":labels,"values":vals}], "layout":{"title":"Pie chart"}}
-                try: verify_pie({"labels": labels, "values": vals})
-                except Exception: pass
-                return HTMLResponse(_studio_shell(q, "Pie chart rendered from inline values.", error="-", fig_json=fig, cyto=None, mermaid=None, segments_obj=None))
-            if "bar" in qs:
-                fig = {"data":[{"type":"bar","x":labels,"y":vals}], "layout":{"title":"Bar chart","yaxis":{"title":"Value"}}}
-                try: verify_bar({"x": labels, "y": vals})
-                except Exception: pass
-                return HTMLResponse(_studio_shell(q, "Bar chart rendered from inline values.", error="-", fig_json=fig, cyto=None, mermaid=None, segments_obj=None))
-
-        # 4) simple line series
-        if "line" in qs or "weekly" in qs:
-            seq = re.findall(r"(\d+(?:\.\d+)?)", q)
-            if seq:
-                ys = [float(x) for x in seq]
-                xs = list(range(1, len(ys)+1))
-                fig = {"data":[{"type":"scatter","mode":"lines","x":xs,"y":ys}], "layout":{"title":"Line chart"}}
-                try: verify_line({"x": xs, "y": ys})
-                except Exception: pass
-                return HTMLResponse(_studio_shell(q, "Line chart rendered from your series.", error="-", fig_json=fig, cyto=None, mermaid=None, segments_obj=None))
-
-        # 5) last resort: chart spec via LLM
-        try:
-            raw = get_chart_spec_from_text(q, MODEL)
-            if isinstance(raw, dict) and raw:
-                if raw.get("mode") == "diagram":
-                    mermaid_src = _sanitize_mermaid(raw.get("mermaid") or _default_mermaid())
-                    walk = {
-                        "segments": [
-                            {"type": "text", "content": "Here’s a simple view of the scenario."},
-                            {"type": "viz", "mode": "diagram", "mermaid": mermaid_src},
-                            {"type": "text", "content": "Follow the arrows from left to right; controls attach at the critical steps."},
-                        ],
-                        "labels": []
-                    }
-                    return HTMLResponse(_studio_shell(q, "Concept diagram generated from your question.", error="-", fig_json=None, cyto=None, mermaid=None, segments_obj=walk))
-                fig = _chart_spec_to_plotly(raw)
-                explanation = raw.get("alt_text") or "Chart rendered from LLM spec."
-                return HTMLResponse(_studio_shell(q, explanation, error="-", fig_json=fig, cyto=None, mermaid=None, segments_obj=None))
-        except Exception:
-            pass
-
-        # default help
-        explanation = ("Try a process diagram (e.g., phishing lifecycle), a function (e.g., “draw x^2”), "
-                       "a ROC request (“positives ...; negatives ...”), or inline values for bar/pie/line. "
-                       "You can also use the topic presets.")
-        return HTMLResponse(_studio_shell(q, explanation, error="-", fig_json=None, cyto=None, mermaid=None, segments_obj=None))
-
-    except Exception as e:
-        explanation = "An error occurred."
-        error = str(e)
-        return HTMLResponse(_studio_shell(q, explanation, error, None, None, mermaid=None, segments_obj=None))
-
-# ------------------------------ Shell renderer ------------------------------
-def _studio_shell(
-    q: str,
-    explanation: str,
-    error: str,
-    fig_json,
-    cyto,
-    mermaid: str | None = None,
-    segments_obj: dict | None = None,
-) -> str:
-    q_safe           = html.escape(q or "")
-    explanation_safe = html.escape(_to_text(explanation) or "")
-    error_safe       = html.escape(_to_text(error) or "-")
-    fig_literal      = json.dumps(fig_json)  # None -> "null"
-    cyto_json        = json.dumps(cyto or {}, ensure_ascii=False)
-    mermaid_json     = json.dumps(mermaid) if mermaid else "null"
-    preset_json      = json.dumps(TOPIC_PRESETS, ensure_ascii=False)
-
-    # ---- Segments branch (LLM walkthrough) ----
-    if segments_obj:
-        segments = segments_obj.get("segments", [])
-        blocks = []
-        viz_payloads = []  # (kind, payload_json, container_id)
-        viz_idx = 0
-        first_mermaid_payload = None
-
-        for seg in segments:
-            t = (seg or {}).get("type")
-            if t == "text":
-                content = seg.get("content", "")
-                blocks.append(f'<div class="seg seg-text">{content}</div>')
-            elif t == "viz":
-                mode = (seg.get("mode") or "").lower()
-                cid = f"viz_{viz_idx}"; viz_idx += 1
-                if mode in ("chart", "graph"):
-                    blocks.append(f'<div id="{cid}" class="seg seg-viz" style="min-height:120px;margin:12px 0;"></div>')
-                elif mode == "diagram":
-                    blocks.append(
-                        f'<div id="{cid}" class="seg seg-viz" '
-                        'style="min-height:140px;margin:16px 0;border-bottom:1px solid #e5e7eb;padding-bottom:12px"></div>'
-                    )
-                if mode == "chart":
-                    fig = _chart_spec_to_plotly(seg.get("chart") or {})
-                    viz_payloads.append(("plotly", json.dumps(fig), cid))
-                elif mode == "graph":
-                    kg = seg.get("kg") or {}
-                    try:
-                        verify_kg(KnowledgeGraphSpec(**kg))
-                        cyto_payload = kg_cyto_payload(kg)
-                    except Exception:
-                        cyto_payload = {"elements": {"nodes": [], "edges": []}}
-                    viz_payloads.append(("cyto", json.dumps(cyto_payload, ensure_ascii=False), cid))
-                elif mode == "diagram":
-                    mer = seg.get("mermaid") or _default_mermaid()
-                    payload = json.dumps(mer)
-                    if first_mermaid_payload is None:
-                        first_mermaid_payload = payload
-                    viz_payloads.append(("mermaid", payload, cid))
-
-        # Stepper, Ask panel, and Learning Lab
-        stepper_html = """
-<div id="stepper" style="display:flex;gap:8px;margin:12px 0;align-items:center">
-  <button id="prev" type="button">Back</button>
-  <span id="pos" style="min-width:60px;text-align:center"></span>
-  <button id="next" type="button">Next</button>
-</div>
-"""
-        ask_html = """
-<div id="ask_panel" style="margin:12px 0 16px 0;display:flex;gap:8px;align-items:center;flex-wrap:wrap">
-  <input id="ask_box" type="text" placeholder="Ask about this diagram (e.g., what to improve?)" style="flex:1;min-width:240px;padding:8px;border:1px solid #e5e7eb;border-radius:8px">
-  <button id="ask_btn" type="button">Ask</button>
-  <span id="ask_status" style="color:#6b7280"></span>
-</div>
-"""
-        lab_html = """
-<div id="lab" style="margin-top:20px;padding:16px;border:1px solid #e5e7eb;border-radius:12px;background:#fafafa">
-  <h2 style="margin-top:0">Learning Lab</h2>
-  <p style="color:#6b7280">Edit the diagram spec (nodes/edges/defenses). Quick-validate locally or run server notebook.</p>
-  <label for="lab_spec" style="font-weight:600">Diagram spec JSON</label>
-  <textarea id="lab_spec" style="width:100%;height:180px;margin-top:6px;font-family:ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', monospace;border:1px solid #e5e7eb;border-radius:8px;padding:8px"></textarea>
-  <div style="display:flex;gap:8px;margin-top:10px;flex-wrap:wrap">
-    <button id="btn_local_validate" type="button">Quick Validate (Local)</button>
-    <button id="btn_validate" type="button">Validate in Notebook</button>
-    <input id="lab_q" type="text" placeholder="Optional: what should I notice?" style="flex:1;min-width:220px;padding:8px;border:1px solid #e5e7eb;border-radius:8px"/>
-    <button id="btn_explain" type="button">Explain Artifacts</button>
-  </div>
-  <div id="lab_out" style="margin-top:12px;background:#fff;border:1px solid #e5e7eb;border-radius:8px;padding:12px;white-space:pre-wrap"></div>
-</div>
-""".strip()
-
-        # body
-        body_html = stepper_html + ask_html + "\n".join(blocks) + ("\n" + lab_html if SHOW_LAB else "")
-        js_lines = []
-
-        # Viz renderers
-        for kind, payload, cid in viz_payloads:
-            if kind == "plotly":
-                js_lines.append(
-                    f"Plotly.newPlot('{cid}', ({payload}).data || ({payload})['data'], ({payload}).layout || ({payload})['layout'], {{responsive:true,displaylogo:false}});"
-                )
-            elif kind == "cyto":
-                js_lines.append(
-                    f"""
-cytoscape({{
-  container: document.getElementById('{cid}'),
-  elements: ({payload}).elements || [],
-  layout: {{ name: 'cose', animate: false }},
-  style: [
-    {{
-      selector: 'node',
-      style: {{
-        'label':'data(label)',
-        'background-color':'#3b82f6',
-        'color':'#111827',
-        'font-size':12
-      }}
-    }},
-    {{
-      selector: 'edge',
-      style: {{
-        'curve-style':'bezier',
-        'target-arrow-shape':'triangle',
-        'line-color':'#9ca3af',
-        'target-arrow-color':'#9ca3af',
-        'label':'data(rel)',
-        'font-size':10
-      }}
-    }}
-  ]
-}});
-"""
-                )
-            elif kind == "mermaid":
-                js_lines.append(
-                    f"""
-mermaid.render('m_{cid}', {payload}).then(({{svg, bindFunctions}}) => {{
-  document.getElementById('{cid}').innerHTML = svg;
-  if (bindFunctions) bindFunctions(document.getElementById('{cid}'));
-}}).catch(err => {{
-  document.getElementById('{cid}').innerHTML = '<div style="color:#b91c1c">Mermaid error: ' + (err && err.message ? err.message : err) + '</div>';
-}});
-"""
-                )
-
-        # Stepper/pulse + Preset dropdown + Local/Server validators + Ask + localStorage
-        js_lines.append(f"""
-(function uiInit(){{
-  try {{
-    const form = document.querySelector('form[action="/studio"]');
-    if (form) {{
-      const sel = document.createElement('select');
-      sel.id = 'preset';
-      sel.style.cssText = 'padding:10px;border:1px solid #d1d5db;border-radius:8px;margin-right:8px';
-      sel.innerHTML = '<option value="">Topic presets…</option>' + Object.keys({preset_json}).map(k => '<option>'+k+'</option>').join('');
-      const qbox = form.querySelector('input[name="q"]');
-      form.insertBefore(sel, qbox);
-      sel.onchange = () => {{
-        const k = sel.value;
-        if (k && {preset_json}[k]) qbox.value = {preset_json}[k];
-      }};
-    }}
-  }} catch(e){{}}
-
-  const blocks = Array.from(document.querySelectorAll('.seg'));
-  let i = 0;
-  function show(k){{
-    i = Math.max(0, Math.min(blocks.length-1, k));
-    blocks.forEach((b,idx)=> b.style.display = (idx===i ? '' : 'none'));
-    const pos = document.getElementById('pos'); if (pos) pos.textContent = (i+1)+'/'+blocks.length;
-    window.dispatchEvent(new CustomEvent('tv-step-change', {{detail:{{index:i}}}}));
-  }}
-  const prev = document.getElementById('prev');
-  const next = document.getElementById('next');
-  if (prev) prev.onclick = ()=>show(i-1);
-  if (next) next.onclick = ()=>show(i+1);
-  if (blocks.length) show(0);
-
-  const style = document.createElement('style');
-  style.textContent = '.pulse{{animation:pulse .9s ease-out 1}}@keyframes pulse{{0%{{filter:drop-shadow(0 0 0 #34d399)}}50%{{filter:drop-shadow(0 0 8px #34d399)}}100%{{filter:drop-shadow(0 0 0 #34d399)}}}}';
-  document.head.appendChild(style);
-  window.addEventListener('tv-step-change', (ev) => {{
-    const seg = blocks[ev.detail.index];
-    if (!seg) return;
-    const rect = seg.querySelector('svg g.node rect');
-    if (rect) {{ rect.classList.add('pulse'); setTimeout(()=>rect.classList.remove('pulse'), 900); }}
-  }});
-
-  // Learning Lab bootstrap (prefill spec) + localStorage persistence
-  try {{
-    const ta = document.getElementById('lab_spec');
-    if (ta) {{
-      const KEY = 'tv_last_spec';
-      const saved = localStorage.getItem(KEY);
-      let spec = saved ? JSON.parse(saved) : {{"nodes":[{{"id":"A","label":"Recon"}},{{"id":"B","label":"Initial Access"}}],
-                   "edges":[["A","B",{{"label":"progression"}}]],
-                   "defenses":[{{"attachTo":"B","label":"MFA"}}]}};
-      ta.value = JSON.stringify(spec, null, 2);
-      ta.addEventListener('input', () => {{
-        try {{ localStorage.setItem(KEY, ta.value); }} catch(_){{
-          /* ignore quota errors */
-        }}
-      }});
-    }}
-  }} catch(e){{}}
-
-  // Local validator
-  const btnLocal = document.getElementById('btn_local_validate');
-  if (btnLocal) btnLocal.onclick = () => {{
-    const out = document.getElementById('lab_out');
-    try {{
-      const spec = JSON.parse(document.getElementById('lab_spec').value);
-      const nodes = new Set((spec.nodes||[]).map(n => n.id || n.label).filter(Boolean));
-      const edges = (spec.edges||[]).map(e => Array.isArray(e) ? [e[0],e[1]] : [e.src||e.source, e.dst||e.target]);
-      const deg = {{}}; nodes.forEach(n=>deg[n]=0);
-      edges.forEach(([a,b])=>{{ if(a&&b){{ deg[a]=(deg[a]||0)+1; deg[b]=(deg[b]||0)+1; }} }});
-      const isolated = Object.entries(deg).filter(([,d]) => d===0).map(([n])=>n);
-      const adj = {{}}; nodes.forEach(n=>adj[n]=[]);
-      edges.forEach(([a,b])=>{{ if(a&&b) adj[a].push(b); }});
-      function hasCycle(){{
-        const vis = new Set(), stack = new Set();
-        function dfs(v){{
-          vis.add(v); stack.add(v);
-          for(const w of adj[v]){{ if(!vis.has(w) && dfs(w)) return true; if(stack.has(w)) return true; }}
-          stack.delete(v); return false;
-        }}
-        for(const n of nodes){{ if(!vis.has(n) && dfs(n)) return true; }}
-        return false;
-      }}
-      const verdicts = [];
-      if (hasCycle()) verdicts.push("Flow contains cycles; remove back-edges.");
-      if ((spec.defenses||[]).length === 0) verdicts.push("No defensive controls attached.");
-      if (isolated.length) verdicts.push("Isolated nodes: " + JSON.stringify(isolated.slice(0,5)));
-      const result = {{checks:{{node_count:nodes.size, edge_count:edges.length, isolated_nodes:isolated}}, verdicts: verdicts.length?verdicts:["OK"]}};
-      out.textContent = "Artifacts (local):\\n" + JSON.stringify(result, null, 2);
-      window.__tv_artifacts = result;
-    }} catch(e){{
-      out.textContent = "Invalid spec JSON.";
-    }}
-  }};
-
-  // Server-side notebook validate
-  const btnValidate = document.getElementById('btn_validate');
-  if (btnValidate) btnValidate.onclick = async () => {{
-    const out = document.getElementById('lab_out');
-    out.textContent = 'Running notebook on server…';
-    try {{
-      const spec = JSON.parse(document.getElementById('lab_spec').value);
-      const res = await fetch('/lab/validate', {{
-        method: 'POST', headers: {{'Content-Type': 'application/json'}}, body: JSON.stringify(spec)
-      }});
-      const data = await res.json();
-      if (!data.ok) throw new Error(data.error || 'validate failed');
-      window.__tv_artifacts = data.artifacts;
-      out.textContent = "Artifacts (server):\\n" + JSON.stringify(data.artifacts, null, 2);
-    }} catch (e) {{
-      out.textContent = "Server validation error: " + (e && e.message ? e.message : e);
-    }}
-  }};
-
-  // LLM explanation of artifacts
-  const btnExplain = document.getElementById('btn_explain');
-  if (btnExplain) btnExplain.onclick = async () => {{
-    const out = document.getElementById('lab_out');
-    out.textContent = 'Asking the model to explain notebook results…';
-    try {{
-      const spec = JSON.parse(document.getElementById('lab_spec').value);
-      const q    = (document.getElementById('lab_q')?.value || '').trim();
-      const res = await fetch('/lab/explain', {{
-        method: 'POST', headers: {{'Content-Type': 'application/json'}}, body: JSON.stringify({{ spec, q }})
-      }});
-      const data = await res.json();
-      if (!data.ok) throw new Error(data.error || 'explain failed');
-      const pre = "Artifacts (server):\\n" + JSON.stringify(data.artifacts, null, 2) + "\\n\\n";
-      out.textContent = pre + (data.explanation || "(no explanation returned)");
-    }} catch (e) {{
-      out.textContent = "Explain error: " + (e && e.message ? e.message : e);
-    }}
-  }};
-
-  // Optional: Ask about this diagram
-  const askBtn = document.getElementById('ask_btn');
-  const askBox = document.getElementById('ask_box');
-  const askStatus = document.getElementById('ask_status');
-  if (askBtn && askBox) {{
-    // expose first diagram mermaid to window for /studio/ask
-    window.__tv_first_mermaid = {first_mermaid_payload if first_mermaid_payload else "null"};
-    askBtn.onclick = async () => {{
-      const q = (askBox.value || '').trim();
-      if (!q) {{ askStatus.textContent = 'Type a question first.'; return; }}
-      askStatus.textContent = 'Thinking…';
-      try {{
-        const res = await fetch('/studio/ask', {{
-          method: 'POST',
-          headers: {{'Content-Type': 'application/json'}},
-          body: JSON.stringify({{ mermaid: window.__tv_first_mermaid || '', q }})
-        }});
-        const data = await res.json();
-        if (!data.ok) throw new Error(data.error || 'ask failed');
-        askStatus.textContent = '';
-        alert(data.answer || '(no answer)');
-      }} catch (e) {{
-        askStatus.textContent = 'Ask error: ' + (e && e.message ? e.message : e);
-      }}
-    }};
-  }}
-}})();
+# ---------- special diagrams ----------
+def _diagram_cia()->str:
+  return _sanitize_mermaid("""flowchart LR
+C[Confidentiality] --> P1[Access Control]
+I[Integrity] --> P2[Checksums/Signing]
+A[Availability] --> P3[Redundancy/Backups]
+C -.-> DC1[Encryption at Rest/In Transit]
+I -.-> DC2[Hash, Code Signing, WORM]
+A -.-> DC3[Failover, DDoS Mitigation]
 """)
 
-        js_all = "\n".join(js_lines)
+def _diagram_zerotrust()->str:
+  return _sanitize_mermaid("""flowchart LR
+R[Request] --> P[Policy: Identity + Device + Context]
+P --> G[Grant Least Privilege]
+G --> V[Continuous Verification]
+V --> Rv[Re-evaluate/Block]
+P -.-> M1[MFA/WebAuthn]
+P -.-> M2[Device Posture]
+G -.-> M3[Segmentation]
+""")
 
-        return f"""
-<html>
-  <head>
-    <meta charset="utf-8"/>
-    <title>TrustViz Studio</title>
-    <script src="https://cdn.plot.ly/plotly-latest.min.js"></script>
-    <script src="https://unpkg.com/cytoscape@3.26.0/dist/cytoscape.min.js"></script>
-    <script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
-    <style>
-      body {{ font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; padding:16px }}
-      form {{ display:flex; gap:8px; align-items:center }}
-      input[type=text] {{ flex:1; padding:10px; border:1px solid #d1d5db; border-radius:8px }}
-      button {{ padding:10px 16px }}
-      .seg-text {{ line-height:1.55; font-size:15px }}
-    </style>
-  </head>
-  <body>
-    <h1>TrustViz Studio</h1>
-    <form action="/studio" method="get">
-      <input type="text" name="q" value="{q_safe}" placeholder="Ask or choose a preset…"/>
-      <button type="submit">Ask</button>
-    </form>
+# ---------- LLM rules ----------
+ASK_RULES = "Defense-only; <=160 words; use exact diagram labels if helpful; no offensive steps."
+PLAN_RULES = (
+  "Return JSON {make_diagram:boolean, mermaid?:string, summary:string}. "
+  "If make_diagram=true, provide a small Mermaid flowchart (5–8 nodes L->R) and 2–4 dashed controls. "
+  "Respect any 'Required labels:' text by including those labels verbatim as node titles."
+)
+DOC_RULES = (
+  "Summarize like for a security student: 2-sentence overview; 3 key bullets; 2 defender takeaways. "
+  "If a question is provided, answer briefly at the end."
+)
 
-    <h2>Explanation</h2>
-    <p>{explanation_safe}</p>
-    <p style="color:#6b7280">Error: {error_safe}</p>
+# ---------- ingest store ----------
+_INGEST = {"text":"", "images":[]}
 
-    {body_html}
+# ===================== API =====================
 
-    <script>
-      mermaid.initialize({{ startOnLoad: false, securityLevel: "strict", theme: "default" }});
-      {js_all}
-    </script>
-  </body>
-</html>
-"""
+@router.post("/ask")
+async def ask(payload:dict=Body(...)):
+  q = (payload or {}).get("q") or ""
+  if _risky(q): return JSONResponse({"ok":False,"error":"Blocked for safety."}, status_code=400)
+  try:
+    # sources to display beside the answer
+    sources = await _scholar_search(q, per=5)
+    a = gen_text("Answer for a cybersecurity audience. Cite sources by [#] inline where useful.", q, model=MODEL) or ""
+    return JSONResponse({"ok":True, "answer":a.strip(), "sources":sources})
+  except Exception as e:
+    return JSONResponse({"ok":False,"error":f"llm: {e}"}, status_code=500)
 
-    # ---- Mermaid-only ----
-    if mermaid:
-        return f"""
-<html>
-  <head>
-    <meta charset="utf-8"/>
-    <title>TrustViz Studio</title>
-    <script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
-    <style>
-      body {{ font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; padding:16px }}
-      form {{ display:flex; gap:8px; align-items:center }}
-      input[type=text] {{ flex:1; padding:10px; border:1px solid #d1d5db; border-radius:8px }}
-      button {{ padding:10px 16px }}
-      #m1 {{ border:1px solid #e5e7eb; border-radius:12px; margin-top:12px; padding:12px; background:#fff }}
-    </style>
-  </head>
-  <body>
-    <h1>TrustViz Studio</h1>
-    <form action="/studio" method="get">
-      <input type="text" name="q" value="{q_safe}" placeholder="Ask or choose a preset…"/>
-      <button type="submit">Ask</button>
-    </form>
+@router.post("/diagram/plan")
+async def diagram_plan(payload:dict=Body(...)):
+  q = (payload or {}).get("q") or ""
+  if _risky(q): return JSONResponse({"ok":False,"error":"Blocked for safety."}, status_code=400)
 
-    <h2>Explanation</h2>
-    <p>{explanation_safe}</p>
-    <p style="color:#6b7280">Error: {error_safe}</p>
+  # hard-match topics so labels appear exactly when requested
+  ql = q.lower()
+  if "cia triad" in ql or ("confidentiality" in ql and "integrity" in ql and "availability" in ql):
+    mer = _diagram_cia()
+    srcs = await _scholar_search("CIA triad confidentiality integrity availability security controls", per=5)
+    return JSONResponse({"ok":True,"make_diagram":True,"mermaid":mer,"summary":"CIA triad with concrete controls.","sources":srcs})
 
-    <div id="m1" aria-label="Concept diagram"></div>
+  if "zero trust" in ql:
+    mer = _diagram_zerotrust()
+    srcs = await _scholar_search("zero trust architecture policy identity device context continuous verification", per=5)
+    return JSONResponse({"ok":True,"make_diagram":True,"mermaid":mer,"summary":"Zero Trust decision path.","sources":srcs})
 
-    <script>
-      mermaid.initialize({{ startOnLoad: false, securityLevel: "strict", theme: "default" }});
-      const src = {mermaid_json};
-      mermaid.render("graph1", src).then(({{svg, bindFunctions}}) => {{
-        const el = document.getElementById("m1");
-        el.innerHTML = svg;
-        if (bindFunctions) bindFunctions(el);
-      }}).catch(err => {{
-        const el = document.getElementById("m1");
-        el.innerHTML = '<div style="padding:16px;color:#b91c1c">Mermaid error: ' +
-                       (err && err.message ? err.message : String(err)) + '</div>';
-      }});
-    </script>
-  </body>
-</html>
-"""
+  try:
+    # soft LLM plan that honors required labels
+    req_labels = []
+    m = re.search(r"required\s+labels\s*:\s*(.+)$", q, re.I)
+    if m: req_labels = [t.strip() for t in re.split(r"[,/;]| and ", m.group(1)) if t.strip()]
+    user = ("If labels are provided below, include them exactly as node titles.\n"
+            + ("Required labels: " + ", ".join(req_labels) if req_labels else "Required labels:"))
+    res = gen_json(PLAN_RULES, (q+"\n\n"+user), model=MODEL)
+    make = bool(isinstance(res, dict) and res.get("make_diagram"))
+    mer = _sanitize_mermaid((res or {}).get("mermaid") or ( _default_mermaid() if make else "")) if make else None
+    summ = (res or {}).get("summary") or ""
+    srcs = await _scholar_search(q, per=5)
+    return JSONResponse({"ok":True,"make_diagram":make,"mermaid":mer,"summary":summ,"sources":srcs})
+  except Exception as e:
+    return JSONResponse({"ok":False,"error":f"llm: {e}"}, status_code=500)
 
-    # ---- Cytoscape branch ----
-    if cyto is not None:
-        return f"""
-<html>
-  <head>
-    <meta charset="utf-8"/>
-    <title>TrustViz Studio</title>
-    <script src="https://unpkg.com/cytoscape@3.26.0/dist/cytoscape.min.js"></script>
-    <style>
-      body {{ font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; padding:16px }}
-      form {{ display:flex; gap:8px; align-items:center }}
-      input[type=text] {{ flex:1; padding:10px; border:1px solid #d1d5db; border-radius:8px }}
-      button {{ padding:10px 16px }}
-      #cy {{ height:560px; border:1px solid #e5e7eb; border-radius:12px; margin-top:12px; background:#fff }}
-    </style>
-  </head>
-  <body>
-    <h1>TrustViz Studio</h1>
-    <form action="/studio" method="get">
-      <input type="text" name="q" value="{q_safe}" placeholder="Describe a scenario to build a graph…"/>
-      <button type="submit">Ask</button>
-    </form>
+@router.post("/diagram/ask")
+def diagram_ask(payload:dict=Body(...)):
+  mer = (payload or {}).get("mermaid") or ""
+  q = (payload or {}).get("q") or ""
+  if not mer.strip(): return JSONResponse({"ok":False,"error":"No diagram loaded. Plan a diagram first."}, status_code=400)
+  if _risky(q) or _risky(mer): return JSONResponse({"ok":False,"error":"Blocked for safety."}, status_code=400)
+  labels = ", ".join(_labels_from_mermaid(mer))
+  try:
+    user = "Diagram:\n" + mer + "\n\nYou may reference labels: " + labels + "\n\nQuestion:\n" + q
+    a = gen_text(ASK_RULES, user, model=MODEL) or ""
+    return JSONResponse({"ok":True,"answer":a.strip()})
+  except Exception as e:
+    return JSONResponse({"ok":False,"error":f"llm: {e}"}, status_code=500)
 
-    <h2>Explanation</h2>
-    <p>{explanation_safe}</p>
-    <p style="color:#6b7280">Error: {error_safe}</p>
+# ---------- notebook & docs ----------
+@router.get("/notebook/templates")
+def notebook_templates():
+  tpls = [
+    {"id":"cycle_check","label":"Graph sanity (cycles/isolates)","code":
+     "import json, networkx as nx\nARTIFACTS['checks']={}\nG=nx.DiGraph()\n"
+     "for n in spec.get('nodes',[]): G.add_node(n.get('id') or n.get('label'))\n"
+     "for e in spec.get('edges',[]):\n"
+     "    a,b=(e[0],e[1]) if isinstance(e,(list,tuple)) else (e.get('source'),e.get('target'))\n"
+     "    if a and b: G.add_edge(a,b)\n"
+     "ARTIFACTS['checks']['node_count']=G.number_of_nodes()\n"
+     "ARTIFACTS['checks']['edge_count']=G.number_of_edges()\n"
+     "ARTIFACTS['checks']['is_dag']=nx.is_directed_acyclic_graph(G)\n"
+     "ARTIFACTS['checks']['isolated']=[n for n in G.nodes() if G.degree(n)==0]\n"
+     "ARTIFACTS['verdicts']=(['OK'] if ARTIFACTS['checks']['is_dag'] and not ARTIFACTS['checks']['isolated'] else [])\n"
+     "if not ARTIFACTS['checks']['is_dag']: ARTIFACTS.setdefault('verdicts',[]).append('Has cycle(s)')\n"
+     "if ARTIFACTS['checks']['isolated']: ARTIFACTS.setdefault('verdicts',[]).append('Isolated nodes present')\n"},
+    {"id":"sources_to_table","label":"Show sources as a table","code":
+     "import pandas as pd\nARTIFACTS['sources_table']=pd.DataFrame(SOURCES).to_dict(orient='records')"}
+  ]
+  return JSONResponse({"ok":True,"templates":tpls})
 
-    <div id="cy" aria-label="Knowledge graph"></div>
+@router.post("/notebook/run")
+def notebook_run(payload:dict=Body(...)):
+  code = (payload or {}).get("code") or ""
+  spec = (payload or {}).get("spec") or {}
+  sources = (payload or {}).get("sources") or []
+  if _risky(json.dumps(spec)): return JSONResponse({"ok":False,"error":"Blocked for safety."}, status_code=400)
+  nb = NotebookRunner(timeout_s=10)
+  try:
+    pre  = "ARTIFACTS={}\n"
+    pre += "spec=" + json.dumps(spec) + "\n"
+    pre += "SOURCES=" + json.dumps(sources) + "\n"
+    res = nb.run([pre + code])
+    return JSONResponse({"ok":True,"artifacts":res.artifacts or {}})
+  except Exception as e:
+    return JSONResponse({"ok":False,"error":str(e)}, status_code=400)
+  finally:
+    nb.stop()
 
-    <script>
-      const payload = {cyto_json};
-      cytoscape({{
-        container: document.getElementById('cy'),
-        elements: payload.elements || [],
-        layout: {{ name: 'cose', animate: false }},
-        style: [
-          {{
-            selector: 'node',
-            style: {{
-              'label': 'data(label)',
-              'background-color': '#3b82f6',
-              'color': '#111827',
-              'text-valign': 'center',
-              'text-halign': 'center',
-              'font-size': 12,
-              'width': 30,
-              'height': 30
-            }}
-          }},
-          {{
-            selector: 'edge',
-            style: {{
-              'curve-style': 'bezier',
-              'target-arrow-shape': 'triangle',
-              'line-color': '#9ca3af',
-              'target-arrow-color': '#9ca3af',
-              'label': 'data(rel)',
-              'font-size': 10,
-              'text-background-color': '#ffffff',
-              'text-background-opacity': 0.85,
-              'text-background-padding': 2
-            }}
-          }}
-        ]
-      }});
-    </script>
-  </body>
-</html>
-"""
+@router.post("/docs/upload")
+async def docs_upload(file: UploadFile = File(...)):
+  try:
+    b = await file.read()
+    text = ""
+    if file.filename.lower().endswith(".pdf"):
+      reader = PdfReader(io.BytesIO(b))
+      for p in reader.pages[:12]:
+        text += (p.extract_text() or "") + "\n"
+    else:
+      try: text = b.decode("utf-8", errors="ignore")[:10000]
+      except Exception: text = ""
+    if not text.strip(): text="(no extractable text)"
+    _INGEST["text"]=text; _INGEST["images"]=[]
+    return JSONResponse({"ok":True,"chars":len(text)})
+  except Exception as e:
+    return JSONResponse({"ok":False,"error":str(e)}, status_code=400)
 
-    # ---- Plotly (charts / math) branch ----
-    return f"""
-<html>
-  <head>
-    <meta charset="utf-8"/>
-    <title>TrustViz Studio</title>
-    <script src="https://cdn.plot.ly/plotly-latest.min.js"></script>
-    <style>
-      body {{ font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; padding:16px }}
-      form {{ display:flex; gap:8px; align-items:center }}
-      input[type=text] {{ flex:1; padding:10px; border:1px solid #d1d5db; border-radius:8px }}
-      button {{ padding:10px 16px }}
-      #chart {{ height:520px; border:1px solid #e5e7eb; border-radius:12px; margin-top:12px; background:#fff }}
-      .controls {{ margin:8px 0; display:flex; gap:8px; align-items:center }}
-      .controls input[type=number] {{ width:120px; padding:6px; border:1px solid #e5e7eb; border-radius:8px }}
-    </style>
-  </head>
-  <body>
-    <h1>TrustViz Studio</h1>
-    <form action="/studio" method="get">
-      <input type="text" name="q" value="{q_safe}" placeholder="Ask for a function (e.g., draw x^2), ROC, or give bar/pie/line values…"/>
-      <button type="submit">Ask</button>
-    </form>
+@router.post("/docs/upload_image")
+async def docs_upload_image(file: UploadFile = File(...)):
+  try:
+    b = await file.read()
+    b64 = "data:image/png;base64," + base64.b64encode(b).decode("ascii")
+    _INGEST["images"].append(b64)
+    return JSONResponse({"ok":True,"images":len(_INGEST['images'])})
+  except Exception as e:
+    return JSONResponse({"ok":False,"error":str(e)}, status_code=400)
 
-    <h2>Explanation</h2>
-    <p>{explanation_safe}</p>
-    <p style="color:#6b7280">Error: {error_safe}</p>
+@router.post("/docs/summarize")
+async def docs_summarize(payload:dict=Body(...)):
+  q = (payload or {}).get("q") or ""
+  if _risky(q): return JSONResponse({"ok":False,"error":"Blocked for safety."}, status_code=400)
+  body = "Document excerpt:\n" + (_INGEST["text"][:4000] or "(empty)") + f"\nImages: {len(_INGEST['images'])}\n"
+  srcs = await _scholar_search(q or "cyber security", per=5)
+  try:
+    out = gen_text(DOC_RULES + "\nCite sources inline by [#] where useful.", body, model=MODEL) or ""
+    return JSONResponse({"ok":True,"summary":out.strip(),"sources":srcs})
+  except Exception as e:
+    return JSONResponse({"ok":False,"error":f"llm: {e}"}, status_code=500)
 
-    <div class="controls" aria-label="Chart controls">
-      <label>xmin <input id="xmin" type="number" step="0.5" /></label>
-      <label>xmax <input id="xmax" type="number" step="0.5" /></label>
-      <button id="rescale" type="button">Rescale</button>
+# ===================== UI =====================
+
+@router.get("/scholarviz", response_class=HTMLResponse)
+def scholarviz(request: Request, q: str = Query("", description="Ask the model")):
+  page = """
+<!doctype html><html><head>
+<meta charset="utf-8"/><title>ScholarViz</title>
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+<style>
+body{font-family:ui-sans-serif,system-ui,-apple-system;margin:0} header{background:#0f172a;color:#fff;padding:12px 16px}
+main{max-width:960px;margin:0 auto;padding:16px} .card{border:1px solid #e5e7eb;border-radius:12px;padding:14px;margin:12px 0}
+textarea,input,button,select{font-size:14px} textarea,input{border:1px solid #e5e7eb;border-radius:8px;padding:8px}
+button{background:#111827;color:#fff;border:none;border-radius:8px;padding:8px 12px;cursor:pointer} button:hover{background:#0f172a}
+#diagram_view svg{max-width:100%} .src a{text-decoration:none}
+</style>
+<script>mermaid.initialize({startOnLoad:false});</script>
+</head><body>
+<header><h1 style="margin:0;font-size:18px">ScholarViz</h1></header>
+<main>
+
+<div class="card">
+  <h3 style="margin:0 0 8px">Ask the LLM</h3>
+  <div style="display:flex;gap:8px;flex-wrap:wrap">
+    <input id="ask_q" placeholder="e.g., Summarize Zero Trust in 120 words" style="flex:1;min-width:240px"/>
+    <button id="ask_go">Ask</button>
+  </div>
+  <pre id="ask_out" style="white-space:pre-wrap;margin-top:10px"></pre>
+  <div id="ask_src" class="src" style="margin-top:6px"></div>
+  <button id="ask_to_nb" style="margin-top:6px;display:none">Send sources to Notebook</button>
+</div>
+
+<div class="card">
+  <h3 style="margin:0 0 8px">Plan a Diagram</h3>
+  <div style="display:flex;gap:8px;flex-wrap:wrap">
+    <input id="plan_q" placeholder="e.g., CIA triad with explicit labels" style="flex:1;min-width:240px"/>
+    <button id="plan_go">Plan</button>
+    <button id="plan_grounded">Grounded Plan (from PDFs)</button>
+  </div>
+  <p id="plan_sum" style="color:#6b7280"></p>
+  <div id="plan_src" class="src" style="margin-top:6px"></div>
+
+  <!-- New grounded-output area -->
+  <pre id="plan_g_out" style="white-space:pre-wrap;margin-top:10px"></pre>
+
+  <div id="diagram_view" class="card" style="display:none"></div>
+</div>
+
+
+<div class="card">
+  <h3 style="margin:0 0 8px">Ask about this Diagram</h3>
+  <div style="display:flex;gap:8px;flex-wrap:wrap">
+    <input id="d_q" placeholder="e.g., Where does WebAuthn help most?" style="flex:1;min-width:240px"/>
+    <button id="d_go" disabled>Ask</button>
+  </div>
+  <pre id="d_out" style="white-space:pre-wrap;margin-top:10px"></pre>
+</div>
+
+<div class="card">
+  <h3 style="margin:0 0 8px">Notebook + Papers/Diagrams</h3>
+  <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+    <input id="doc_file" type="file"/><button id="doc_up">Upload PDF/Text</button>
+    <input id="img_file" type="file" accept="image/*"/><button id="img_up">Upload Diagram</button>
+    <input id="doc_q" placeholder="Ask about the uploaded material…" style="flex:1;min-width:240px"/>
+    <button id="doc_sum">Summarize/Answer</button>
+  </div>
+  <pre id="doc_out" style="white-space:pre-wrap;margin-top:10px"></pre>
+  <div id="doc_src" class="src" style="margin-top:6px"></div>
+
+  <div class="card" style="margin-top:10px">
+    <h4 style="margin:0 0 8px">Notebook</h4>
+    <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+      <select id="nb_tpl"><option value="">Templates…</option></select><button id="nb_load">Load</button>
     </div>
+    <textarea id="nb_code" style="width:100%;height:160px;margin-top:8px"></textarea>
+    <div style="display:flex;gap:8px;margin-top:8px;flex-wrap:wrap">
+      <button id="nb_run">Run</button>
+      <input id="nb_spec" placeholder="(optional) spec JSON" style="flex:1;min-width:240px"/>
+    </div>
+    <pre id="nb_out" style="white-space:pre-wrap;margin-top:10px"></pre>
+  </div>
+</div>
 
-    <div id="chart" role="img" aria-label="Chart"></div>
+</main>
+<script>
+let CURRENT_MERMAID = null;
+let LAST_SOURCES = [];
 
-    <script>
-      const rawFig = {fig_literal};
-      const fig = (typeof rawFig === 'string') ? (rawFig ? JSON.parse(rawFig) : null) : rawFig;
+async function post(path, body, form){
+  const res = await fetch(path, {method:'POST', headers: form?undefined:{'Content-Type':'application/json'}, body: form?body:JSON.stringify(body||{})});
+  return res.json();
+}
+function renderSources(el, src){
+  if (!src || !src.length){ el.innerHTML=''; return; }
+  el.innerHTML = '<strong>Sources:</strong><ol>' + src.map((s,i)=>(
+    `<li><a href="${s.url||'#'}" target="_blank">[${i+1}] ${s.title} (${s.year||''})</a>` +
+    (s.authors?` — <span style="color:#6b7280">${s.authors}</span>`:'') +
+    (s.venue?` <em style="color:#6b7280">· ${s.venue}</em>`:'') + `</li>`
+  )).join('') + '</ol>';
+}
 
-      if (fig) {{
-        fig.layout = fig.layout || {{}};
-        fig.layout.dragmode = 'pan';
-        fig.layout.hovermode = 'x unified';
-        fig.layout.margin = {{l:60, r:20, t:40, b:60}};
-        fig.layout.xaxis = Object.assign({{
-          title: {{text: (fig.layout.xaxis && fig.layout.xaxis.title && fig.layout.xaxis.title.text) || 'x'}},
-          zeroline: true, zerolinewidth: 2,
-          showline: true, linewidth: 1, mirror: true,
-          gridcolor: '#e5e7eb',
-          showspikes: true, spikemode: 'across', spikesnap: 'cursor'
-        }}, fig.layout.xaxis || {{}});
-        fig.layout.yaxis = Object.assign({{
-          title: {{text: (fig.layout.yaxis && fig.layout.yaxis.title && fig.layout.yaxis.title.text) || 'y'}},
-          zeroline: true, zerolinewidth: 2,
-          showline: true, linewidth: 1, mirror: true,
-          gridcolor: '#e5e7eb',
-          showspikes: true, spikemode: 'across', spikesnap: 'cursor'
-        }}, fig.layout.yaxis || {{}});
+document.getElementById('ask_go').onclick = async ()=>{
+  const q = document.getElementById('ask_q').value.trim();
+  document.getElementById('ask_out').textContent='…';
+  const d = await post('/ask', {q});
+  if (!d.ok){ document.getElementById('ask_out').textContent='Error: '+d.error; return; }
+  document.getElementById('ask_out').textContent = (d.answer||'(no answer)');
+  LAST_SOURCES = d.sources||[];
+  renderSources(document.getElementById('ask_src'), LAST_SOURCES);
+  document.getElementById('ask_to_nb').style.display = LAST_SOURCES.length? 'inline-block':'none';
+};
+document.getElementById('ask_to_nb').onclick = ()=>{
+  const code = "import pandas as pd\\nARTIFACTS['sources_table']=pd.DataFrame(SOURCES).to_dict(orient='records')";
+  document.getElementById('nb_code').value = code;
+  document.getElementById('nb_out').textContent = "Loaded a cell to show sources as a table. Click Run.";
+};
 
-        (fig.data || []).forEach(tr => {{
-          if (!tr.mode) tr.mode = 'lines';
-          tr.line = Object.assign({{width: 3}}, tr.line || {{}});
-        }});
+document.getElementById('plan_go').onclick = async ()=>{
+  const q = document.getElementById('plan_q').value.trim();
+  document.getElementById('plan_sum').textContent='…';
+  const d = await post('/diagram/plan', {q});
+  if (!d.ok){ document.getElementById('plan_sum').textContent='Error: '+d.error; return; }
+  document.getElementById('plan_sum').textContent = d.summary||'';
+  renderSources(document.getElementById('plan_src'), d.sources||[]);
+  const view = document.getElementById('diagram_view');
+  if (d.make_diagram && d.mermaid){
+    CURRENT_MERMAID = d.mermaid;
+    view.style.display='block'; view.textContent='';
+    mermaid.render('schviz_svg', d.mermaid).then(r=>view.innerHTML=r.svg).catch(_=>view.textContent='Mermaid error');
+    document.getElementById('d_go').disabled = false;
+  } else {
+    CURRENT_MERMAID = null; view.style.display='none';
+    document.getElementById('d_go').disabled = true;
+  }
+};
 
-        const config = {{
-          responsive: true,
-          displaylogo: false,
-          scrollZoom: true,
-          modeBarButtonsToRemove: ['select2d','lasso2d','autoScale2d','toggleSpikelines']
-        }};
+/* NEW: grounded plan click handler — placed immediately after plan_go */
+document.getElementById('plan_grounded').onclick = async ()=>{
+  const q = document.getElementById('plan_q').value.trim();
+  const out = document.getElementById('plan_g_out');
+  const view = document.getElementById('diagram_view');
+  out.textContent = 'Fetching OA PDFs and synthesizing…';
+  try{
+    const d = await fetch('/diagram/grounded', {
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({q})
+    }).then(r=>r.json());
 
-        Plotly.newPlot('chart', fig.data, fig.layout, config);
+    if (!d.ok){
+      out.textContent = 'Error: ' + d.error;
+      CURRENT_MERMAID = null;
+      document.getElementById('d_go').disabled = true;
+      return;
+    }
 
-        const xIn = document.getElementById('xmin');
-        const xAx = document.getElementById('xmax');
-        const btn = document.getElementById('rescale');
-        if (fig.data && fig.data.length && fig.data[0].x && xIn && xAx && btn) {{
-          const xs = (fig.data[0].x || []).map(Number).filter(v => Number.isFinite(v));
-          if (xs.length) {{
-            xIn.value = Math.min(...xs).toFixed(2);
-            xAx.value = Math.max(...xs).toFixed(2);
-          }}
-          btn.onclick = () => {{
-            const lo = parseFloat(xIn.value);
-            const hi = parseFloat(xAx.value);
-            if (isFinite(lo) && isFinite(hi) && lo < hi) {{
-              Plotly.relayout('chart', {{'xaxis.range': [lo, hi]}});
-            }}
-          }};
-        }}
-      }}
-    </script>
-  </body>
-</html>
+    out.textContent = (d.summary||'') + (d.cites && d.cites.length ? `\\nCites: ${JSON.stringify(d.cites)}` : '');
+
+    if (d.mermaid){
+      CURRENT_MERMAID = d.mermaid;
+      view.style.display='block'; view.textContent='';
+      mermaid.render('schviz_gsvg', d.mermaid)
+        .then(r=>view.innerHTML=r.svg)
+        .catch(_=>view.textContent='Mermaid error');
+      document.getElementById('d_go').disabled=false;
+    } else {
+      CURRENT_MERMAID = null;
+      view.style.display='none';
+      document.getElementById('d_go').disabled=true;
+    }
+
+    renderSources(document.getElementById('plan_src'), d.sources||[]);
+
+    const lis = (d.snippets||[])
+      .map((s,i)=>`[${i}] ${s.text.substring(0,300)}${s.text.length>300?'…':''}`)
+      .join('\\n\\n');
+    out.textContent += lis ? `\\n\\nTop snippets:\\n${lis}` : '';
+
+  } catch(e){
+    out.textContent = 'Error: ' + e.message;
+  }
+};
+
+document.getElementById('d_go').onclick = async ()=>{
+  const q = document.getElementById('d_q').value.trim();
+  const out = document.getElementById('d_out');
+  if (!CURRENT_MERMAID){ out.textContent = "No diagram loaded. Plan a diagram first."; return; }
+  out.textContent='…';
+  const d = await post('/diagram/ask', { q, mermaid: CURRENT_MERMAID });
+  out.textContent = d.ok ? (d.answer||'(no answer)') : ('Error: '+d.error);
+};
+
+document.getElementById('doc_up').onclick = async ()=>{
+  const f = document.getElementById('doc_file').files[0];
+  if (!f){ document.getElementById('doc_out').textContent='Choose a PDF/text file'; return; }
+  const fd = new FormData(); fd.append('file', f);
+  document.getElementById('doc_out').textContent='Uploading…';
+  const d = await post('/docs/upload', fd, true);
+  document.getElementById('doc_out').textContent = d.ok? ('Uploaded. Extracted chars: '+d.chars):('Error: '+d.error);
+};
+
+document.getElementById('img_up').onclick = async ()=>{
+  const f = document.getElementById('img_file').files[0];
+  if (!f){ document.getElementById('doc_out').textContent='Choose an image'; return; }
+  const fd = new FormData(); fd.append('file', f);
+  document.getElementById('doc_out').textContent='Uploading image…';
+  const d = await post('/docs/upload_image', fd, true);
+  document.getElementById('doc_out').textContent = d.ok? ('Images stored: '+d.images):('Error: '+d.error);
+};
+
+document.getElementById('doc_sum').onclick = async ()=>{
+  const q = document.getElementById('doc_q').value.trim();
+  document.getElementById('doc_out').textContent='Summarizing…';
+  const d = await fetch('/docs/summarize', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({q})}).then(r=>r.json());
+  document.getElementById('doc_out').textContent = d.ok? (d.summary||'(no summary)'):('Error: '+d.error);
+  renderSources(document.getElementById('doc_src'), d.sources||[]);
+};
+
+(async function nbInit(){
+  const sel=document.getElementById('nb_tpl'), load=document.getElementById('nb_load'), run=document.getElementById('nb_run'), out=document.getElementById('nb_out');
+  if (!sel||!load||!run) return;
+  try{
+    const d=await fetch('/notebook/templates').then(r=>r.json());
+    if (d.ok){ d.templates.forEach(t=>{ const o=document.createElement('option'); o.value=t.id; o.textContent=t.label; o.dataset.code=t.code; sel.appendChild(o); }); }
+  }catch(_){}
+  load.onclick=()=>{ const o=sel.options[sel.selectedIndex]; const c=o&&o.dataset.code; if(c) document.getElementById('nb_code').value=c; };
+  run.onclick=async ()=>{
+    const code=document.getElementById('nb_code').value.trim();
+    const specRaw=document.getElementById('nb_spec').value.trim();
+    let spec={}; if (specRaw){ try{ spec=JSON.parse(specRaw);}catch(_){ }}
+    out.textContent='Running…';
+    const d=await post('/notebook/run', {code, spec, sources: LAST_SOURCES });
+    out.textContent = d.ok? JSON.stringify(d.artifacts||{}, null, 2) : ('Error: '+d.error);
+  };
+})();
+</script>
+</body></html>
 """
+  return HTMLResponse(page)
 
+@router.get("/studio", response_class=HTMLResponse)
+def studio_alias(request: Request, q: str = Query("", description="Ask the model")):
+    return scholarviz(request, q)
+
+@router.get("/", response_class=HTMLResponse)
+def root_alias(request: Request):
+    # optional: land on ScholarViz
+    return scholarviz(request, q="")
+
+# ---------- OA PDF helpers ----------
+async def _open_access_hits(q: str, per: int = 6) -> List[dict]:
+  url = "https://api.openalex.org/works"
+  now = datetime.date.today()
+  start = f"{now.year-4}-01-01"
+  params = {
+    "search": q,
+    "filter": f"from_publication_date:{start},language:en,primary_location.source.type:journal",
+    "sort": "publication_date:desc",
+    "per_page": per
+  }
+  try:
+    async with httpx.AsyncClient(timeout=14.0) as hx:
+      r = await hx.get(url, params=params); r.raise_for_status()
+      res = r.json().get("results", [])
+  except Exception:
+    return []
+  out = []
+  for w in res:
+    loc = w.get("primary_location",{}) or {}
+    oa = w.get("open_access",{}) or {}
+    url_pdf = (loc.get("pdf_url") or oa.get("oa_url") or "")
+    out.append({
+      "title": w.get("title") or "(untitled)",
+      "year": w.get("publication_year") or "",
+      "venue": (loc.get("source",{}) or {}).get("display_name"),
+      "url": loc.get("landing_page_url") or oa.get("oa_url") or w.get("id"),
+      "pdf": url_pdf if (url_pdf and url_pdf.lower().endswith(".pdf")) else "",
+      "authors": ", ".join(a.get("author",{}).get("display_name","") for a in (w.get("authorships") or [])[:4])
+    })
+  return [h for h in out if h.get("pdf")]
+
+def _split_blocks(txt: str) -> List[str]:
+  txt = re.sub(r"\s+", " ", txt or "").strip()
+  blocks = re.split(r"(?<=\.)\s{2,}|(?:\n\s*){2,}", txt)
+  return [b.strip() for b in blocks if len(b.strip()) > 120][:120]
+
+def _fig_captions(raw: str) -> List[str]:
+  caps = re.findall(r"(?:Figure|Fig\.?)\s*\d+[:\.\)]\s*[^\n\.]+(?:\.[^\n\.]+)?", raw, flags=re.I)
+  return [c.strip() for c in caps][:40]
+
+def _rank_snippets(q: str, snippets: List[str], k: int = 10) -> List[dict]:
+  try:
+    from sklearn.feature_extraction.text import TfidfVectorizer
+    import numpy as np
+    vec = TfidfVectorizer(stop_words="english", max_features=8000)
+    X = vec.fit_transform(snippets + [q])
+    sims = (X[:-1] @ X[-1].T).toarray().ravel()
+    idx = np.argsort(-sims)[:k]
+    return [{"i": int(i), "text": snippets[int(i)], "score": float(sims[int(i)])} for i in idx]
+  except Exception:
+    ql = set(re.findall(r"[a-z0-9]+", q.lower()))
+    scored = []
+    for i, s in enumerate(snippets):
+      sl = set(re.findall(r"[a-z0-9]+", s.lower()))
+      scored.append((i, len(ql & sl)))
+    scored.sort(key=lambda t: -t[1])
+    return [{"i": i, "text": snippets[i], "score": float(sc)} for i, sc in scored[:k]]
+
+async def _fetch_pdf_text(url: str) -> str:
+  try:
+    async with httpx.AsyncClient(timeout=20.0, follow_redirects=True) as hx:
+      r = await hx.get(url); r.raise_for_status()
+      b = r.content
+  except Exception:
+    return ""
+  txt = ""
+  try:
+    if PdfReader is not None:
+      reader = PdfReader(io.BytesIO(b))
+      for p in reader.pages[:20]: txt += (p.extract_text() or "") + "\n"
+    elif 'fitz' in globals() and fitz is not None:
+      doc = fitz.open(stream=b, filetype="pdf")
+      for i, page in enumerate(doc):
+        if i >= 20: break
+        txt += (page.get_text() or "") + "\n"
+  except Exception:
+    pass
+  return txt
+
+GROUNDED_RULES = (
+  "Use provided snippets to synthesize a small Mermaid diagram (5–8 nodes, LR) with 2–4 dashed control nodes."
+  " Output JSON: {mermaid:string, summary:string, cites:number[]}."
+  " Each node/edge choice must be inferable from snippets; cite with indices in 'cites' and reference them inline as [#] in the summary."
+  " Do not invent procedures; defense-only. If snippets are insufficient, say so and set mermaid to ''."
+)
+
+@router.post("/diagram/grounded")
+async def diagram_grounded(payload:dict=Body(...)):
+  q = (payload or {}).get("q") or ""
+  if _risky(q): return JSONResponse({"ok":False,"error":"Blocked for safety."}, status_code=400)
+
+  hits = await _open_access_hits(q, per=8)
+  if not hits: return JSONResponse({"ok":False,"error":"No OA PDFs found"}, status_code=404)
+
+  texts = []
+  for h in hits[:3]:
+    t = await _fetch_pdf_text(h["pdf"])
+    if t: texts.append((h, t))
+
+  if not texts: return JSONResponse({"ok":False,"error":"Could not extract text from OA PDFs"}, status_code=502)
+
+  pool = []
+  for h, t in texts:
+    caps = _fig_captions(t)
+    blks = _split_blocks(t)
+    pool.extend([f"[cap] {c}" for c in caps] + blks)
+
+  top = _rank_snippets(q, pool, k=10)
+  bundle = {"query": q, "snippets": [{"idx": s["i"], "text": s["text"]} for s in top]}
+
+  try:
+    user = json.dumps(bundle, ensure_ascii=False)
+    res = gen_json(GROUNDED_RULES, user, model=MODEL) or {}
+    mer = _sanitize_mermaid((res or {}).get("mermaid") or "")
+    summ = (res or {}).get("summary") or ""
+    cites = (res or {}).get("cites") or []
+    return JSONResponse({
+      "ok": True,
+      "mermaid": mer,
+      "summary": summ,
+      "cites": cites,
+      "snippets": bundle["snippets"],
+      "sources": hits  # show which PDFs were used
+    })
+  except Exception as e:
+    return JSONResponse({"ok":False,"error":f"llm: {e}"}, status_code=500)

@@ -3,3 +3,43 @@ python-dotenv>=1.0
 jupyter_client>=8.6
 pyzmq>=25
 tornado>=6.4
+
+
+# --- Web server ---
+fastapi==0.115.5
+uvicorn[standard]==0.32.0
+python-dotenv>=1.0.1
+
+# --- LLM (Gemini) ---
+google-generativeai==0.7.2
+
+# --- Notebook runner (server-side “Learning Lab”) ---
+jupyter-client>=8.6.2
+nbformat>=5.10.4
+nbclient>=0.10.0
+ipykernel>=6.29.5
+
+# --- Deterministic compute helpers ---
+networkx>=3.2.1
+
+# --- Math/ML utilities used in ROC fallback and charts ---
+numpy==1.26.4        # pinned to keep TF 2.16.x happy
+scikit-learn>=1.4.2  # optional but nice for ROC/AUC (we have a fallback if missing)
+
+# --- (Optional) TensorFlow for your edu/activation demo endpoints ---
+# On Apple Silicon/macOS:
+tensorflow-macos==2.16.2
+
+# If you ever run CPU-only Linux:
+# tensorflow==2.16.2
+httpx>=0.27
+tenacity>=8.3
+unstructured>=0.14.6
+pypdf>=5.0.1
+pymupdf>=1.24.10
+pillow>=10.4.0
+
+# scholarly data
+openalexapi>=1.1.0   # tiny helper (or just use raw HTTP to OpenAlex)
+semanticscholar>=0.6.1
+arxiv>=2.1.0
