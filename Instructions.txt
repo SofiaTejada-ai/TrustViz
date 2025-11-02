@@ -1,5 +1,5 @@
 1. Be in TrustViz folder
-2. export GEMINI_API_KEY="AIzaSyAAjY1EaDtkiVdFG2UqWUfSLyrAdzfx1zc"
+2. export GEMINI_API_KEY=""
 3. uvicorn trustviz.server.app:app --host 127.0.0.1 --port 8000 --reload
 4. If #3 doesn't work, load everything from requirements.tx
 source .venv/bin/activate
