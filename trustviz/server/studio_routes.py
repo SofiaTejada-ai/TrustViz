@@ -1,11 +1,13 @@
 # trustviz/server/studio_routes.py — ScholarViz (LLM→Mermaid + sources + robust OA + graceful grounded fallback)
 # + Diversity knobs: n, seed, diversify, temp (controlled randomness for grounded variants)
+# + Export endpoint (SVG/PNG) with optional light branding (does not alter LLM/grounded flow)
+# + FIX: preserve subgraph/style/class lines and hex colors so yellow “Controls” box renders
 
 import os, re, io, json, html, base64, datetime, random
 from typing import List, Tuple
 
 from fastapi import APIRouter, Body, UploadFile, File, Request, Query
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, Response  # added Response
 from pypdf import PdfReader
 import httpx
 
@@ -27,8 +29,10 @@ USE_GROUNDED_DEFAULT = True
 def _risky(s:str)->bool: return any(re.search(p,(s or "").lower()) for p in _DENY)
 
 # ---------- mermaid allowlist/sanitize ----------
-_ALLOWED = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789[]()_:.-> \n|/%'\",+&?-")
-def _sanitize_mermaid(s:str)->str: return "".join(ch for ch in (s or "") if ch in _ALLOWED)
+# FIX 1: allow '#' and ';' so hex colors & style lists survive
+_ALLOWED = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789[]()_:.-> \n|/%'\",+&?-#;")
+def _sanitize_mermaid(s:str)->str:
+  return "".join(ch for ch in (s or "") if ch in _ALLOWED)
 
 _NODE_DEF = re.compile(r"^\s*([A-Za-z0-9_]+)\s*[\[\(]", re.M)
 _EDGE = re.compile(r"\b([A-Za-z0-9_]+)\s*-[.-]*>\s*([A-Za-z0-9_]+)\b")
@@ -210,6 +214,7 @@ def _strip_fences(s:str)->str:
   m = _MER_BLOCK.search(s or "")
   return m.group(1).strip() if m else (s or "")
 
+# keep LR; normalize "graph" to "flowchart"
 def _coerce_flowchart_lr(s: str) -> str:
   s = (s or "").strip()
   s = re.sub(r"(?i)^\s*graph\b", "flowchart", s)
@@ -223,15 +228,22 @@ def _coerce_flowchart_lr(s: str) -> str:
 def _normalize_arrows(s: str) -> str:
   return (s or "").replace("–>", "->").replace("—>", "->").replace("⇒", "->").replace("→", "->")
 
+# FIX 2: keep subgraph/style/class lines during trimming
 def _trim_extraneous_text(s: str) -> str:
+  keep_prefixes = ("flowchart","graph","classDiagram","sequenceDiagram","stateDiagram",
+                   "subgraph","end","classDef","style","linkStyle","click")
   out = []
   for line in (s.splitlines() if s else []):
     t = (line or "").strip()
-    if not t: continue
-    if t.lower().startswith(("flowchart","graph","classDiagram","sequenceDiagram","stateDiagram")):
-      out.append(t); continue
+    if not t:
+      continue
+    tl = t.lower()
+    if tl.startswith(keep_prefixes):
+      out.append(t)
+      continue
     if "->" in t or "-.->" in t or re.search(r"\b[A-Za-z0-9_]+\s*[\[\(].*[\]\)]", t):
-      out.append(t); continue
+      out.append(t)
+      continue
   return "\n".join(out).strip()
 
 def _is_plausible_mermaid(s: str) -> bool:
@@ -240,6 +252,7 @@ def _is_plausible_mermaid(s: str) -> bool:
   nodes = re.findall(r"\b[A-Za-z0-9_]+\s*[\[\(][^\]\)]+[\]\)]", s)
   return len(nodes) >= 2
 
+# FIX 3: don’t purge subgraph/style lines; avoid auto-node-defs when subgraphs are present
 def _repair_mermaid(src: str) -> str:
   s = _strip_fences(src)
   s = _trim_extraneous_text(s)
@@ -247,19 +260,28 @@ def _repair_mermaid(src: str) -> str:
   s = _normalize_arrows(s)
   s = _sanitize_mermaid(s)
 
+  has_subgraph = bool(re.search(r"(?i)^\s*subgraph\b", s, re.M))
+
   good = []
   for line in s.splitlines():
     t = line.strip()
-    if t.startswith("flowchart"):
-      good.append(t); continue
+    if not t:
+      continue
+    tl = t.lower()
+    if tl.startswith(("flowchart","subgraph","end","classdef","style","linkstyle","click")):
+      good.append(t)
+      continue
+    # keep well-formed node/edge lines
     if t.count("[") == t.count("]") and t.count("(") == t.count(")"):
       good.append(t)
 
-  # ✅ define s2 before use
   s2 = "\n".join(good).strip()
-  s2 = _ensure_node_defs(s2)
 
-  # Optional: style dashed edges
+  # only auto-define nodes when NOT using subgraphs (prevents grouping mistakes)
+  if not has_subgraph:
+    s2 = _ensure_node_defs(s2)
+
+  # dashed edge cosmetics
   if "-.->" in s2 and "classDef dashed" not in s2:
     s2 += "\nclassDef dashed stroke-dasharray: 4 3,stroke:#888,color:#555;"
 
@@ -269,7 +291,8 @@ def _repair_mermaid(src: str) -> str:
   # Fallback: rebuild from ASCII arrows if present
   ascii_try = _ascii_to_mermaid(src)
   if _is_plausible_mermaid(ascii_try):
-    ascii_try = _ensure_node_defs(ascii_try)
+    if not has_subgraph:
+      ascii_try = _ensure_node_defs(ascii_try)
     if "-.->" in ascii_try and "classDef dashed" not in ascii_try:
       ascii_try += "\nclassDef dashed stroke-dasharray: 4 3,stroke:#888,color:#555;"
     return ascii_try
@@ -310,6 +333,8 @@ def _llm_mermaid_plan(q: str, req_labels: List[str] | None = None) -> Tuple[str,
   schema = (
     "Return JSON exactly as {make_diagram:boolean, mermaid:string, summary:string}. "
     "The 'mermaid' MUST be a valid Mermaid flowchart with 'flowchart LR' on the first line. "
+    "You MAY group related nodes using 'subgraph <Title>' ... 'end' and style the group, e.g. "
+    "'style <Title> fill:#FEF3C7,stroke:#EAB308,stroke-width:1px'. "
     "Do NOT use code fences. 5–8 nodes. Prefer nouns in square boxes. "
     "Use dashed edges for controls/side-constraints. "
     + ("Include these node titles verbatim: " + ", ".join(req_labels) + ". " if req_labels else "")
@@ -330,6 +355,35 @@ DOC_RULES = (
 
 # ---------- ingest store ----------
 _INGEST = {"text":"", "images":[]}
+
+# ---------- light branding injector for exported SVG ----------
+def _inject_brand_css(svg_text: str, brand: dict | None) -> str:
+  """
+  Very light-touch theming by injecting a <style> block into the SVG.
+  brand: {"primary":"#0ea5e9","stroke":"#0f172a","font":"Inter, ui-sans-serif","rounded":True}
+  """
+  if not brand:
+    return svg_text
+  primary = brand.get("primary", "#0ea5e9")
+  stroke  = brand.get("stroke",  "#0f172a")
+  font    = brand.get("font",    "ui-sans-serif, system-ui, -apple-system")
+  rounded = brand.get("rounded", True)
+
+  style = f"""
+  <style>
+    .mermaid text {{ font-family: {font}; fill: {stroke}; }}
+    .mermaid .node rect, .mermaid .node polygon, .mermaid .cluster rect {{
+      fill: {primary}1A; stroke: {stroke}; {'rx: 12px; ry: 12px;' if rounded else ''} 
+    }}
+    .mermaid .edgePath path {{ stroke: {stroke}; }}
+    .mermaid .label text {{ fill: {stroke}; }}
+    .mermaid .cluster text {{ fill: {stroke}; font-weight: 600; }}
+    .mermaid .flowchart-link {{ stroke: {stroke}; }}
+    .mermaid .edgePath path[stroke-dasharray] {{ stroke: {stroke}; }}
+  </style>
+  """.strip()
+
+  return re.sub(r"(<svg[^>]*>)", r"\1" + style, svg_text, count=1, flags=re.I)
 
 # ===================== API =====================
 
@@ -508,6 +562,48 @@ async def docs_summarize(payload:dict=Body(...)):
   except Exception as e:
     return JSONResponse({"ok":False,"error":f"llm: {e}"}, status_code=500)
 
+# ---------- export endpoint (SVG or PNG with optional branding) ----------
+@router.post("/export")
+def export_image(payload: dict = Body(...)):
+  """
+  Input:
+    { "svg": "<svg ...>...</svg>", "format": "svg" | "png", "scale": 1.0,
+      "brand": {optional theme dict}, "filename": "diagram" }
+  """
+  svg_text = (payload or {}).get("svg") or ""
+  fmt = ((payload or {}).get("format") or "svg").lower()
+  scale = float((payload or {}).get("scale") or 1.0)
+  brand = (payload or {}).get("brand") or None
+  fname = (payload or {}).get("filename") or "diagram"
+
+  if not svg_text.strip():
+    return JSONResponse({"ok": False, "error": "No SVG provided"}, status_code=400)
+
+  # light brand pass
+  svg_text = _inject_brand_css(svg_text, brand)
+
+  if fmt == "svg":
+    return Response(
+      content=svg_text.encode("utf-8"),
+      media_type="image/svg+xml",
+      headers={"Content-Disposition": f'attachment; filename="{fname}.svg"'}
+    )
+
+  elif fmt == "png":
+    try:
+      import cairosvg
+      png_bytes = cairosvg.svg2png(bytestring=svg_text.encode("utf-8"), scale=scale)
+      return Response(
+        content=png_bytes,
+        media_type="image/png",
+        headers={"Content-Disposition": f'attachment; filename="{fname}.png"'}
+      )
+    except Exception as e:
+      return JSONResponse({"ok": False, "error": f"PNG convert: {e}"}, status_code=500)
+
+  else:
+    return JSONResponse({"ok": False, "error": f"Unknown format: {fmt}"}, status_code=400)
+
 # ===================== UI =====================
 
 @router.get("/scholarviz", response_class=HTMLResponse)
@@ -556,6 +652,21 @@ button{background:#111827;color:#fff;border:none;border-radius:8px;padding:8px 1
     <summary>Show raw Mermaid</summary>
     <pre id="mer_raw" style="white-space:pre-wrap"></pre>
   </details>
+
+  <!-- Export + Branding controls (new) -->
+  <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:8px">
+    <select id="brand_sel">
+      <option value="">No brand</option>
+      <option value='{"primary":"#0ea5e9","stroke":"#0f172a","font":"Inter, ui-sans-serif","rounded":true}'>Sky/Slate</option>
+      <option value='{"primary":"#22c55e","stroke":"#052e16","font":"Inter, ui-sans-serif","rounded":true}'>Green Lab</option>
+      <option value='{"primary":"#a78bfa","stroke":"#312e81","font":"Inter, ui-sans-serif","rounded":true}'>Iris</option>
+    </select>
+    <button id="exp_svg" disabled>Export SVG</button>
+    <button id="exp_png" disabled>Export PNG</button>
+    <input id="exp_name" placeholder="diagram filename" style="min-width:160px"/>
+    <input id="exp_scale" type="number" step="0.1" value="1.0" title="PNG scale" style="width:90px"/>
+  </div>
+
   <div id="fig_thumbs" style="margin-top:10px"></div>
 </div>
 
@@ -607,6 +718,43 @@ function renderSources(el, src){
   el.innerHTML = '<strong>Sources:</strong><ol>' + src.map((s,i)=>(`<li><a href="${s.url||'#'}" target="_blank">[${i+1}] ${s.title} (${s.year||''})</a>` + (s.authors?` — <span style="color:#6b7280">${s.authors}</span>`:'') + (s.venue?` <em style="color:#6b7280">· ${s.venue}</em>`:'') + `</li>`)).join('') + '</ol>';
 }
 
+function currentSVGString(){
+  const el = document.querySelector('#diagram_view svg');
+  if (!el) return '';
+  let s = el.outerHTML;
+  if (!/xmlns=/.test(s)) s = s.replace('<svg', '<svg xmlns="http://www.w3.org/2000/svg"');
+  return s;
+}
+
+async function exportDiagram(fmt){
+  const svg = currentSVGString();
+  if (!svg){ alert('No rendered diagram.'); return; }
+  const brandSel = document.getElementById('brand_sel');
+  let brand = null;
+  try { brand = brandSel && brandSel.value ? JSON.parse(brandSel.value) : null; } catch(_){}
+  const filename = (document.getElementById('exp_name').value || 'diagram').trim();
+  const scale = parseFloat(document.getElementById('exp_scale').value || '1.0');
+  const res = await fetch('/export', {
+    method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({ svg, format: fmt, scale, brand, filename })
+  });
+  if (!res.ok){
+    const j = await res.json().catch(()=> ({}));
+    alert('Export failed: ' + (j.error || res.statusText));
+    return;
+  }
+  const blob = await res.blob();
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url; a.download = filename + '.' + (fmt==='png'?'png':'svg');
+  document.body.appendChild(a); a.click(); a.remove();
+  URL.revokeObjectURL(url);
+}
+
+document.getElementById('exp_svg').onclick = ()=> exportDiagram('svg');
+document.getElementById('exp_png').onclick = ()=> exportDiagram('png');
+
 document.getElementById('ask_go').onclick = async ()=>{
   const q = document.getElementById('ask_q').value.trim();
   document.getElementById('ask_out').textContent='…';
@@ -638,7 +786,12 @@ document.getElementById('plan_go').onclick = async ()=>{
     CURRENT_MERMAID = d.mermaid;
     view.style.display='block'; view.textContent='';
     rawWrap.style.display = 'none'; rawPre.textContent = '';
-    mermaid.render('schviz_svg', d.mermaid).then(r=>view.innerHTML=r.svg).catch(_=>{
+    mermaid.render('schviz_svg', d.mermaid).then(r=>{
+      view.innerHTML=r.svg;
+      // enable exports when rendered
+      document.getElementById('exp_svg').disabled = false;
+      document.getElementById('exp_png').disabled = false;
+    }).catch(_=>{
       view.textContent='Mermaid error';
       rawPre.textContent = d.mermaid || '(empty)';
       rawWrap.style.display = 'block';
@@ -664,7 +817,7 @@ document.getElementById('plan_grounded').onclick = async ()=>{
     const d = await fetch('/diagram/grounded', {
       method:'POST',
       headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({ q, n: 3, diversify: true, seed: Date.now() % 1e9, temp: 0.6 }) // diversity knobs
+      body: JSON.stringify({ q, n: 3, diversify: true, seed: Date.now() % 1e9, temp: 0.6 })
     }).then(r=>r.json());
 
     if (!d.ok){
@@ -682,17 +835,36 @@ document.getElementById('plan_grounded').onclick = async ()=>{
       view.style.display='block'; view.textContent='';
       rawWrap.style.display = 'none'; rawPre.textContent = '';
       mermaid.render('schviz_gsvg', d.mermaid)
-        .then(r=>view.innerHTML=r.svg)
+        .then(r=>{
+          view.innerHTML=r.svg;
+          // enable exports when rendered
+          document.getElementById('exp_svg').disabled = false;
+          document.getElementById('exp_png').disabled = false;
+        })
         .catch(_=>{
           view.textContent='Mermaid error';
           rawPre.textContent = d.mermaid || '(empty)';
           rawWrap.style.display = 'block';
         });
       document.getElementById('d_go').disabled=false;
+
+      // subtle seasoning
+      (function season(){
+        const svg = document.querySelector('#diagram_view svg');
+        if (!svg) return;
+        const seed = Math.abs([...Date.now().toString()].reduce((a,c)=>a + c.charCodeAt(0),0)) % 9973;
+        const jitter = 0.25 + (seed % 20)/100;
+        svg.querySelectorAll('.edgePath path').forEach(p => p.setAttribute('stroke-width', (1.2*jitter).toFixed(2)));
+        svg.querySelectorAll('.node rect').forEach(r => {
+          const base = 10 + (seed % 6);
+          r.setAttribute('rx', base); r.setAttribute('ry', base);
+        });
+      })();
     } else {
       CURRENT_MERMAID = null;
       view.style.display='none';
-      rawWrap.style.display='none'; rawPre.textContent='';
+      rawWrap.style.display='none';
+      rawPre.textContent='';
       document.getElementById('d_go').disabled=true;
     }
 
@@ -711,8 +883,6 @@ document.getElementById('plan_grounded').onclick = async ()=>{
       </div>`).join('');
       figsDiv.innerHTML = "<div style='margin-top:8px'><strong>Figures used:</strong><br/>"+imgs+"</div>";
     }
-
-    // (Optional) could show d.alternatives here as tabs/previews.
 
   } catch(e){
     out.textContent = 'Error: ' + e.message;
