@@ -1,7 +1,9 @@
-# trustviz/server/studio_routes.py — ScholarViz (compact + sources + fixed ask)
+# trustviz/server/studio_routes.py — ScholarViz (LLM→Mermaid + sources + robust OA + graceful grounded fallback)
+# + Diversity knobs: n, seed, diversify, temp (controlled randomness for grounded variants)
 
-import os, re, io, json, html, base64, datetime
-from typing import List
+import os, re, io, json, html, base64, datetime, random
+from typing import List, Tuple
+
 from fastapi import APIRouter, Body, UploadFile, File, Request, Query
 from fastapi.responses import HTMLResponse, JSONResponse
 from pypdf import PdfReader
@@ -20,16 +22,65 @@ _DENY = [
   r"\bpassword\s*cracker\b", r"\bport\s*scan\s*(script|code)\b", r"\bsql\s*injection\s*(payload|exploit)\b",
   r"\bbypass\s+mfa\b", r"\breal\s+bank\s+site\b", r"\bhow\s+to\s+(hack|bypass)\b", r"\bbypass\b", r"\bhack(?:ing)?\b"
 ]
+USE_GROUNDED_DEFAULT = True
+
 def _risky(s:str)->bool: return any(re.search(p,(s or "").lower()) for p in _DENY)
 
+# ---------- mermaid allowlist/sanitize ----------
 _ALLOWED = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789[]()_:.-> \n|/%'\",+&?-")
 def _sanitize_mermaid(s:str)->str: return "".join(ch for ch in (s or "") if ch in _ALLOWED)
+
+_NODE_DEF = re.compile(r"^\s*([A-Za-z0-9_]+)\s*[\[\(]", re.M)
+_EDGE = re.compile(r"\b([A-Za-z0-9_]+)\s*-[.-]*>\s*([A-Za-z0-9_]+)\b")
+
+def _ensure_node_defs(s: str) -> str:
+    if not s.strip(): return s
+    existing = set(m.group(1) for m in _NODE_DEF.finditer(s))
+    refs = set()
+    for a, b in _EDGE.findall(s):
+        refs.add(a); refs.add(b)
+    missing = [nid for nid in refs if nid not in existing]
+    if not missing: return s
+    lines = s.splitlines()
+    insert_at = 1 if lines else 0
+    for nid in missing:
+        lines.insert(insert_at, f"{nid}[{nid}]")
+        insert_at += 1
+    return "\n".join(lines)
 
 def _default_mermaid()->str:
   return ("flowchart LR\n"
           "  Q[Question] --> D[High-level Diagram]\n"
           "  D --> K[Key Controls]\n"
           "  K --> O[Outcomes]\n")
+
+# ---------- OA query normalization ----------
+def _normalize_for_oa(q: str) -> List[str]:
+  """Return a list of progressively-broader queries for OpenAlex."""
+  if not q: return []
+  q0 = re.sub(r"[“”‘’\"'’→⇒—–\-–>]+", " ", q)
+  q0 = re.sub(r"[^A-Za-z0-9\s\+\.]", " ", q0)
+  q0 = re.sub(r"\s+", " ", q0).strip()
+
+  lower = q0.lower()
+  expanded = lower
+  expanded = expanded.replace("dlp", "data loss prevention")
+  expanded = expanded.replace("saas", "software as a service")
+  expanded = expanded.replace("zero trust", "zero trust architecture")
+
+  tiers = []
+  tiers.append(expanded)
+  if "data loss prevention" in expanded or "dlp" in lower:
+    tiers.append("data loss prevention policy classification quarantine allow cloud")
+  if "software as a service" in expanded or "saas" in lower:
+    tiers.append("cloud security SaaS policy engine content inspection classification")
+  tiers.append(re.sub(r"\b(users?|apps?|classifiers?|policy|quarantine|allow)\b", "", expanded).strip())
+
+  out = []
+  for t in tiers:
+    t = re.sub(r"\s+", " ", t).strip()
+    if t and t not in out: out.append(t)
+  return [o for o in out if o]
 
 # ---------- sources (OpenAlex) ----------
 async def _scholar_search(q:str, per:int=5)->List[dict]:
@@ -67,7 +118,7 @@ def _labels_from_mermaid(src:str)->List[str]:
     if t and t not in seen: seen.add(t); labs.append(t)
   return labs[:20]
 
-# ---------- special diagrams ----------
+# ---------- special diagrams (deterministic fallbacks) ----------
 def _diagram_cia()->str:
   return _sanitize_mermaid("""flowchart LR
 C[Confidentiality] --> P1[Access Control]
@@ -89,13 +140,189 @@ P -.-> M2[Device Posture]
 G -.-> M3[Segmentation]
 """)
 
-# ---------- LLM rules ----------
+def _diagram_dlp()->str:
+  return _sanitize_mermaid("""flowchart LR
+U[Users] --> A[SaaS Apps]
+A --> C[Content Classifiers]
+C --> Po[Policy Engine]
+Po --> Ac[Quarantine/Allow]
+Po -.-> JIT[Just-in-Time Exceptions]
+Po -.-> Aud[Audit / Alerts]
+C -.-> Enc[Encryption at Rest/In Transit]
+""")
+
+# ---------- ASCII ("A -> B : label") to Mermaid ----------
+_ASCII_ARROW_LINE = re.compile(r"^\s*([^#\-\*].*?)\s*(-{1,2}|=|–|—)?>\s*(.+)$")
+_ARROWS = ("->", "-->", "=>", "→", "⇒", "—>", "–>")
+
+def _slug(s: str) -> str:
+  s = re.sub(r"[^A-Za-z0-9_]+", "_", s.strip())
+  return (s or "n").strip("_")[:40] or "n"
+
+def _extract_flow_lines(s: str) -> List[Tuple[str, str, str]]:
+  flows: List[Tuple[str, str, str]] = []
+  if not s: return flows
+  for raw in s.splitlines():
+    line = raw.strip()
+    if not line: continue
+    if any(tok in line for tok in _ARROWS):
+      parts = re.split(r"\s*(?:-+>|=>|→|⇒|—>)\s*", line, maxsplit=1)
+      if len(parts) == 2:
+        a, rest = parts[0].strip(), parts[1].strip()
+        if ":" in rest:
+          b, lbl = rest.split(":", 1)
+          flows.append((a.strip(), b.strip(), lbl.strip()))
+        else:
+          flows.append((a.strip(), rest.strip(), ""))
+        continue
+    m = _ASCII_ARROW_LINE.match(line)
+    if m:
+      a, _, b = m.groups()
+      if ":" in b:
+        b2, lbl = b.split(":", 1)
+        flows.append((a.strip(), b2.strip(), lbl.strip()))
+      else:
+        flows.append((a.strip(), b.strip(), ""))
+  return flows
+
+def _ascii_to_mermaid(s: str, limit: int = 8) -> str:
+  flows = _extract_flow_lines(s)
+  if not flows: return ""
+  nodes: dict = {}
+  edges: List[Tuple[str, str, str]] = []
+  for a, b, lbl in flows:
+    if not a or not b: continue
+    if len(nodes) < limit: nodes.setdefault(a, _slug(a))
+    if len(nodes) < limit: nodes.setdefault(b, _slug(b))
+    if a in nodes and b in nodes: edges.append((a, b, lbl))
+  if len(nodes) < 2 or not edges: return ""
+  lines = ["flowchart LR"]
+  for human, nid in nodes.items(): lines.append(f"{nid}[{human}]")
+  for a, b, lbl in edges:
+    aa, bb = nodes[a], nodes[b]
+    lines.append(f"{aa} -- {lbl} --> {bb}" if lbl else f"{aa} --> {bb}")
+  return _sanitize_mermaid("\n".join(lines))
+
+# ---------- Mermaid repair / normalization ----------
+_MER_BLOCK = re.compile(r"```(?:mermaid)?\s*([\s\S]*?)```", re.I)
+
+def _strip_fences(s:str)->str:
+  m = _MER_BLOCK.search(s or "")
+  return m.group(1).strip() if m else (s or "")
+
+def _coerce_flowchart_lr(s: str) -> str:
+  s = (s or "").strip()
+  s = re.sub(r"(?i)^\s*graph\b", "flowchart", s)
+  if not re.match(r"(?i)^\s*flowchart\s+LR\b", s):
+    if s.lower().startswith("flowchart"):
+      s = re.sub(r"(?i)^\s*flowchart\b.*", "flowchart LR", s, count=1)
+    else:
+      s = "flowchart LR\n" + s
+  return s
+
+def _normalize_arrows(s: str) -> str:
+  return (s or "").replace("–>", "->").replace("—>", "->").replace("⇒", "->").replace("→", "->")
+
+def _trim_extraneous_text(s: str) -> str:
+  out = []
+  for line in (s.splitlines() if s else []):
+    t = (line or "").strip()
+    if not t: continue
+    if t.lower().startswith(("flowchart","graph","classDiagram","sequenceDiagram","stateDiagram")):
+      out.append(t); continue
+    if "->" in t or "-.->" in t or re.search(r"\b[A-Za-z0-9_]+\s*[\[\(].*[\]\)]", t):
+      out.append(t); continue
+  return "\n".join(out).strip()
+
+def _is_plausible_mermaid(s: str) -> bool:
+  if not s or "flowchart" not in s: return False
+  if "->" not in s and "-.->" not in s: return False
+  nodes = re.findall(r"\b[A-Za-z0-9_]+\s*[\[\(][^\]\)]+[\]\)]", s)
+  return len(nodes) >= 2
+
+def _repair_mermaid(src: str) -> str:
+  s = _strip_fences(src)
+  s = _trim_extraneous_text(s)
+  s = _coerce_flowchart_lr(s)
+  s = _normalize_arrows(s)
+  s = _sanitize_mermaid(s)
+
+  good = []
+  for line in s.splitlines():
+    t = line.strip()
+    if t.startswith("flowchart"):
+      good.append(t); continue
+    if t.count("[") == t.count("]") and t.count("(") == t.count(")"):
+      good.append(t)
+
+  # ✅ define s2 before use
+  s2 = "\n".join(good).strip()
+  s2 = _ensure_node_defs(s2)
+
+  # Optional: style dashed edges
+  if "-.->" in s2 and "classDef dashed" not in s2:
+    s2 += "\nclassDef dashed stroke-dasharray: 4 3,stroke:#888,color:#555;"
+
+  if _is_plausible_mermaid(s2):
+    return s2
+
+  # Fallback: rebuild from ASCII arrows if present
+  ascii_try = _ascii_to_mermaid(src)
+  if _is_plausible_mermaid(ascii_try):
+    ascii_try = _ensure_node_defs(ascii_try)
+    if "-.->" in ascii_try and "classDef dashed" not in ascii_try:
+      ascii_try += "\nclassDef dashed stroke-dasharray: 4 3,stroke:#888,color:#555;"
+    return ascii_try
+
+  return ""  # final safe fallback
+
+# ---------- LLM → Mermaid synthesizer (few-shot primed) ----------
+_FEWSHOT = [
+  {
+    "q": "Sketch Data Loss Prevention for SaaS",
+    "mermaid": """flowchart LR
+U[Users] --> A[SaaS Apps]
+A --> C[Content Classifiers]
+C --> P[Policy Engine]
+P -->|Violation| Q[Quarantine]
+P -->|No Violation| AL[Allow]
+P -.-> JIT[Just-in-Time Exceptions]
+P -.-> AUD[Audit/Alerts]"""
+  },
+  {
+    "q": "Zero Trust access decision with device posture and MFA",
+    "mermaid": """flowchart LR
+REQ[Request] --> POL[Policy (Identity+Device+Context)]
+POL -->|Grant| LEAST[Least Privilege]
+LEAST --> MON[Continuous Verification]
+POL -.-> MFA[MFA/WebAuthn]
+POL -.-> POST[Device Posture]
+MON -->|Re-evaluate| BLOCK[Block/Step-up]"""
+  },
+  {
+    "q":"Incident Response lifecycle with playbooks and post-mortem",
+    "mermaid": "flowchart LR\nDET[Detection] --> ANA[Analysis]\nANA --> CON[Containment]\nCON --> ERA[Eradication]\nERA --> REC[Recovery]\nREC --> PM[Post-Mortem]\nPB(Playbooks) -.-> DET\nPB -.-> ANA\nPB -.-> CON\nPB -.-> ERA\nPB -.-> REC"
+  }
+]
+
+def _llm_mermaid_plan(q: str, req_labels: List[str] | None = None) -> Tuple[str, str]:
+  req_labels = req_labels or []
+  schema = (
+    "Return JSON exactly as {make_diagram:boolean, mermaid:string, summary:string}. "
+    "The 'mermaid' MUST be a valid Mermaid flowchart with 'flowchart LR' on the first line. "
+    "Do NOT use code fences. 5–8 nodes. Prefer nouns in square boxes. "
+    "Use dashed edges for controls/side-constraints. "
+    + ("Include these node titles verbatim: " + ", ".join(req_labels) + ". " if req_labels else "")
+  )
+  shots = "\n\n".join(f"Q: {s['q']}\nMermaid:\n{s['mermaid']}" for s in _FEWSHOT)
+  prompt = f"{schema}\n\n{shots}"
+  res = gen_json(prompt, q, model=MODEL) or {}
+  raw_mer = (res.get("mermaid") or "").strip()
+  mer = _repair_mermaid(raw_mer) or _ascii_to_mermaid(raw_mer) or ""
+  return mer, (res.get("summary") or "")
+
+# ---------- LLM rules for other endpoints ----------
 ASK_RULES = "Defense-only; <=160 words; use exact diagram labels if helpful; no offensive steps."
-PLAN_RULES = (
-  "Return JSON {make_diagram:boolean, mermaid?:string, summary:string}. "
-  "If make_diagram=true, provide a small Mermaid flowchart (5–8 nodes L->R) and 2–4 dashed controls. "
-  "Respect any 'Required labels:' text by including those labels verbatim as node titles."
-)
 DOC_RULES = (
   "Summarize like for a security student: 2-sentence overview; 3 key bullets; 2 defender takeaways. "
   "If a question is provided, answer briefly at the end."
@@ -111,8 +338,8 @@ async def ask(payload:dict=Body(...)):
   q = (payload or {}).get("q") or ""
   if _risky(q): return JSONResponse({"ok":False,"error":"Blocked for safety."}, status_code=400)
   try:
-    # sources to display beside the answer
-    sources = await _scholar_search(q, per=5)
+    q_norm = _normalize_for_oa(q)[0] if _normalize_for_oa(q) else q
+    sources = await _scholar_search(q_norm, per=5)
     a = gen_text("Answer for a cybersecurity audience. Cite sources by [#] inline where useful.", q, model=MODEL) or ""
     return JSONResponse({"ok":True, "answer":a.strip(), "sources":sources})
   except Exception as e:
@@ -122,32 +349,55 @@ async def ask(payload:dict=Body(...)):
 async def diagram_plan(payload:dict=Body(...)):
   q = (payload or {}).get("q") or ""
   if _risky(q): return JSONResponse({"ok":False,"error":"Blocked for safety."}, status_code=400)
-
-  # hard-match topics so labels appear exactly when requested
   ql = q.lower()
+
+  if USE_GROUNDED_DEFAULT:
+    hits = await _open_access_hits(q, per=8)  # unchanged call path (defaults keep behavior)
+    if hits:
+      texts = [(h, await _fetch_pdf_text(h["pdf"])) for h in hits[:3]]
+      pool = []
+      for h, t in texts:
+        if not t: continue
+        pool.extend([f"[cap] {c}" for c in _fig_captions(t)] + _split_blocks(t))
+      if pool:
+        top = _rank_snippets(q, pool, k=10)  # default deterministic path
+        bundle = {"query": q, "snippets": [{"idx": s["i"], "text": s["text"]} for s in top]}
+        res = gen_json(GROUNDED_RULES, json.dumps(bundle, ensure_ascii=False), model=MODEL) or {}
+        mer = _repair_mermaid((res or {}).get("mermaid") or "") or _ascii_to_mermaid((res.get("summary") or ""))
+        summ = (res or {}).get("summary") or ""
+        return JSONResponse({"ok": True, "make_diagram": bool(mer), "mermaid": mer, "summary": summ, "sources": hits})
+
   if "cia triad" in ql or ("confidentiality" in ql and "integrity" in ql and "availability" in ql):
     mer = _diagram_cia()
     srcs = await _scholar_search("CIA triad confidentiality integrity availability security controls", per=5)
     return JSONResponse({"ok":True,"make_diagram":True,"mermaid":mer,"summary":"CIA triad with concrete controls.","sources":srcs})
 
-  if "zero trust" in ql:
+  if "zero trust" in ql or "zerotrust" in ql:
     mer = _diagram_zerotrust()
     srcs = await _scholar_search("zero trust architecture policy identity device context continuous verification", per=5)
     return JSONResponse({"ok":True,"make_diagram":True,"mermaid":mer,"summary":"Zero Trust decision path.","sources":srcs})
 
+  dlp_preseed = _diagram_dlp() if ("data loss prevention" in ql or "dlp" in ql) else ""
+
   try:
-    # soft LLM plan that honors required labels
     req_labels = []
     m = re.search(r"required\s+labels\s*:\s*(.+)$", q, re.I)
-    if m: req_labels = [t.strip() for t in re.split(r"[,/;]| and ", m.group(1)) if t.strip()]
-    user = ("If labels are provided below, include them exactly as node titles.\n"
-            + ("Required labels: " + ", ".join(req_labels) if req_labels else "Required labels:"))
-    res = gen_json(PLAN_RULES, (q+"\n\n"+user), model=MODEL)
-    make = bool(isinstance(res, dict) and res.get("make_diagram"))
-    mer = _sanitize_mermaid((res or {}).get("mermaid") or ( _default_mermaid() if make else "")) if make else None
-    summ = (res or {}).get("summary") or ""
-    srcs = await _scholar_search(q, per=5)
-    return JSONResponse({"ok":True,"make_diagram":make,"mermaid":mer,"summary":summ,"sources":srcs})
+    if m:
+      req_labels = [t.strip() for t in re.split(r"[,/;]| and ", m.group(1)) if t.strip()]
+
+    llm_mer, llm_sum = _llm_mermaid_plan(q, req_labels)
+    mer = llm_mer if _is_plausible_mermaid(llm_mer) else ""
+
+    if not mer and dlp_preseed:
+      mer = dlp_preseed
+    if not mer:
+      mer = _default_mermaid()
+
+    q_norms = _normalize_for_oa(q)
+    srcs = await _scholar_search((q_norms[0] if q_norms else q), per=5)
+    summary = llm_sum or ("Data Loss Prevention pipeline with policy enforcement and mitigations." if dlp_preseed else "")
+    return JSONResponse({"ok":True,"make_diagram":bool(mer), "mermaid": mer, "summary": summary, "sources": srcs})
+
   except Exception as e:
     return JSONResponse({"ok":False,"error":f"llm: {e}"}, status_code=500)
 
@@ -183,7 +433,19 @@ def notebook_templates():
      "if not ARTIFACTS['checks']['is_dag']: ARTIFACTS.setdefault('verdicts',[]).append('Has cycle(s)')\n"
      "if ARTIFACTS['checks']['isolated']: ARTIFACTS.setdefault('verdicts',[]).append('Isolated nodes present')\n"},
     {"id":"sources_to_table","label":"Show sources as a table","code":
-     "import pandas as pd\nARTIFACTS['sources_table']=pd.DataFrame(SOURCES).to_dict(orient='records')"}
+     "import pandas as pd\nARTIFACTS['sources_table']=pd.DataFrame(SOURCES).to_dict(orient='records')"},
+    {"id":"edge_trace","label":"Trace edges to snippets","code":
+     "import json\n"
+     "edges = []\n"
+     "for e in spec.get('edges',[]):\n"
+     "  if isinstance(e,(list,tuple)):\n"
+     "    a,b = e[0], e[1]\n"
+     "    lbl = e[2] if len(e)>2 else ''\n"
+     "  else:\n"
+     "    a,b,lbl = e.get('source'), e.get('target'), e.get('label','')\n"
+     "  edges.append({'from':a,'to':b,'label':lbl})\n"
+     "ARTIFACTS['edges']=edges\n"
+     "ARTIFACTS['note']='Manually map each edge to citations [#] from the UI summary.'"}
   ]
   return JSONResponse({"ok":True,"templates":tpls})
 
@@ -227,7 +489,7 @@ async def docs_upload(file: UploadFile = File(...)):
 async def docs_upload_image(file: UploadFile = File(...)):
   try:
     b = await file.read()
-    b64 = "data:image/png;base64," + base64.b64encode(b).decode("ascii")
+    b64 = "data:image/png;base64," + base64.b64encode(b).decode("ascii")  # fixed prefix: comma, not plus
     _INGEST["images"].append(b64)
     return JSONResponse({"ok":True,"images":len(_INGEST['images'])})
   except Exception as e:
@@ -238,7 +500,8 @@ async def docs_summarize(payload:dict=Body(...)):
   q = (payload or {}).get("q") or ""
   if _risky(q): return JSONResponse({"ok":False,"error":"Blocked for safety."}, status_code=400)
   body = "Document excerpt:\n" + (_INGEST["text"][:4000] or "(empty)") + f"\nImages: {len(_INGEST['images'])}\n"
-  srcs = await _scholar_search(q or "cyber security", per=5)
+  q_norms = _normalize_for_oa(q)
+  srcs = await _scholar_search((q_norms[0] if q_norms else (q or "cyber security")), per=5)
   try:
     out = gen_text(DOC_RULES + "\nCite sources inline by [#] where useful.", body, model=MODEL) or ""
     return JSONResponse({"ok":True,"summary":out.strip(),"sources":srcs})
@@ -286,12 +549,15 @@ button{background:#111827;color:#fff;border:none;border-radius:8px;padding:8px 1
   <p id="plan_sum" style="color:#6b7280"></p>
   <div id="plan_src" class="src" style="margin-top:6px"></div>
 
-  <!-- New grounded-output area -->
   <pre id="plan_g_out" style="white-space:pre-wrap;margin-top:10px"></pre>
 
   <div id="diagram_view" class="card" style="display:none"></div>
+  <details id="mer_raw_wrap" style="display:none;margin-top:8px">
+    <summary>Show raw Mermaid</summary>
+    <pre id="mer_raw" style="white-space:pre-wrap"></pre>
+  </details>
+  <div id="fig_thumbs" style="margin-top:10px"></div>
 </div>
-
 
 <div class="card">
   <h3 style="margin:0 0 8px">Ask about this Diagram</h3>
@@ -338,11 +604,7 @@ async function post(path, body, form){
 }
 function renderSources(el, src){
   if (!src || !src.length){ el.innerHTML=''; return; }
-  el.innerHTML = '<strong>Sources:</strong><ol>' + src.map((s,i)=>(
-    `<li><a href="${s.url||'#'}" target="_blank">[${i+1}] ${s.title} (${s.year||''})</a>` +
-    (s.authors?` — <span style="color:#6b7280">${s.authors}</span>`:'') +
-    (s.venue?` <em style="color:#6b7280">· ${s.venue}</em>`:'') + `</li>`
-  )).join('') + '</ol>';
+  el.innerHTML = '<strong>Sources:</strong><ol>' + src.map((s,i)=>(`<li><a href="${s.url||'#'}" target="_blank">[${i+1}] ${s.title} (${s.year||''})</a>` + (s.authors?` — <span style="color:#6b7280">${s.authors}</span>`:'') + (s.venue?` <em style="color:#6b7280">· ${s.venue}</em>`:'') + `</li>`)).join('') + '</ol>';
 }
 
 document.getElementById('ask_go').onclick = async ()=>{
@@ -362,6 +624,7 @@ document.getElementById('ask_to_nb').onclick = ()=>{
 };
 
 document.getElementById('plan_go').onclick = async ()=>{
+  document.getElementById('plan_grounded').click();
   const q = document.getElementById('plan_q').value.trim();
   document.getElementById('plan_sum').textContent='…';
   const d = await post('/diagram/plan', {q});
@@ -369,49 +632,67 @@ document.getElementById('plan_go').onclick = async ()=>{
   document.getElementById('plan_sum').textContent = d.summary||'';
   renderSources(document.getElementById('plan_src'), d.sources||[]);
   const view = document.getElementById('diagram_view');
+  const rawWrap = document.getElementById('mer_raw_wrap');
+  const rawPre  = document.getElementById('mer_raw');
   if (d.make_diagram && d.mermaid){
     CURRENT_MERMAID = d.mermaid;
     view.style.display='block'; view.textContent='';
-    mermaid.render('schviz_svg', d.mermaid).then(r=>view.innerHTML=r.svg).catch(_=>view.textContent='Mermaid error');
+    rawWrap.style.display = 'none'; rawPre.textContent = '';
+    mermaid.render('schviz_svg', d.mermaid).then(r=>view.innerHTML=r.svg).catch(_=>{
+      view.textContent='Mermaid error';
+      rawPre.textContent = d.mermaid || '(empty)';
+      rawWrap.style.display = 'block';
+    });
     document.getElementById('d_go').disabled = false;
   } else {
     CURRENT_MERMAID = null; view.style.display='none';
+    rawWrap.style.display='none'; rawPre.textContent='';
     document.getElementById('d_go').disabled = true;
   }
 };
 
-/* NEW: grounded plan click handler — placed immediately after plan_go */
 document.getElementById('plan_grounded').onclick = async ()=>{
   const q = document.getElementById('plan_q').value.trim();
   const out = document.getElementById('plan_g_out');
   const view = document.getElementById('diagram_view');
+  const rawWrap = document.getElementById('mer_raw_wrap');
+  const rawPre  = document.getElementById('mer_raw');
+  const figsDiv = document.getElementById('fig_thumbs');
   out.textContent = 'Fetching OA PDFs and synthesizing…';
+  figsDiv.innerHTML = '';
   try{
     const d = await fetch('/diagram/grounded', {
       method:'POST',
       headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({q})
+      body: JSON.stringify({ q, n: 3, diversify: true, seed: Date.now() % 1e9, temp: 0.6 }) // diversity knobs
     }).then(r=>r.json());
 
     if (!d.ok){
-      out.textContent = 'Error: ' + d.error;
+      out.textContent = 'Grounded synthesis failed.';
       CURRENT_MERMAID = null;
       document.getElementById('d_go').disabled = true;
       return;
     }
 
-    out.textContent = (d.summary||'') + (d.cites && d.cites.length ? `\\nCites: ${JSON.stringify(d.cites)}` : '');
+    out.textContent = (d.summary||'');
+    if (d.fallback) out.textContent = '(Fallback: '+d.fallback+')\\n' + out.textContent;
 
     if (d.mermaid){
       CURRENT_MERMAID = d.mermaid;
       view.style.display='block'; view.textContent='';
+      rawWrap.style.display = 'none'; rawPre.textContent = '';
       mermaid.render('schviz_gsvg', d.mermaid)
         .then(r=>view.innerHTML=r.svg)
-        .catch(_=>view.textContent='Mermaid error');
+        .catch(_=>{
+          view.textContent='Mermaid error';
+          rawPre.textContent = d.mermaid || '(empty)';
+          rawWrap.style.display = 'block';
+        });
       document.getElementById('d_go').disabled=false;
     } else {
       CURRENT_MERMAID = null;
       view.style.display='none';
+      rawWrap.style.display='none'; rawPre.textContent='';
       document.getElementById('d_go').disabled=true;
     }
 
@@ -421,6 +702,17 @@ document.getElementById('plan_grounded').onclick = async ()=>{
       .map((s,i)=>`[${i}] ${s.text.substring(0,300)}${s.text.length>300?'…':''}`)
       .join('\\n\\n');
     out.textContent += lis ? `\\n\\nTop snippets:\\n${lis}` : '';
+
+    if (d.figures && d.figures.length){
+      const imgs = d.figures.map(f=>`<div style="display:inline-block;margin:6px">
+        <div style="font-size:12px;color:#6b7280">p.${f.page} — ${(f.paper||'')}</div>
+        <img src="${f.png_b64}" style="max-width:160px;display:block;border:1px solid #e5e7eb;border-radius:6px"/>
+        <div style="max-width:160px;font-size:12px;color:#374151">${(f.caption||'').slice(0,160)}</div>
+      </div>`).join('');
+      figsDiv.innerHTML = "<div style='margin-top:8px'><strong>Figures used:</strong><br/>"+imgs+"</div>";
+    }
+
+    // (Optional) could show d.alternatives here as tabs/previews.
 
   } catch(e){
     out.textContent = 'Error: ' + e.message;
@@ -486,44 +778,142 @@ document.getElementById('doc_sum').onclick = async ()=>{
 
 @router.get("/studio", response_class=HTMLResponse)
 def studio_alias(request: Request, q: str = Query("", description="Ask the model")):
-    return scholarviz(request, q)
+  return scholarviz(request, q)
 
 @router.get("/", response_class=HTMLResponse)
 def root_alias(request: Request):
-    # optional: land on ScholarViz
-    return scholarviz(request, q="")
+  return scholarviz(request, q="")
 
-# ---------- OA PDF helpers ----------
-async def _open_access_hits(q: str, per: int = 6) -> List[dict]:
+# ---------- diversity helpers ----------
+def _rng(seed:int):
+  r = random.Random()
+  r.seed(seed if seed else random.SystemRandom().randint(1, 10**9))
+  return r
+
+def _shuffle_with_seed(xs, seed, do=False):
+  xs = list(xs)
+  if do:
+    r = _rng(seed); r.shuffle(xs)
+  return xs
+
+def _uniq(xs):
+  seen=set(); out=[]
+  for x in xs:
+    if x not in seen:
+      seen.add(x); out.append(x)
+  return out
+
+# ---------- OA PDF helpers (broadened + recency + relevance) ----------
+def _try_imports():
+  mod = {}
+  try:
+    import fitz  # PyMuPDF
+    mod['fitz'] = fitz
+  except Exception:
+    mod['fitz'] = None
+  try:
+    import pytesseract
+    from PIL import Image
+    mod['pytesseract'] = pytesseract
+    mod['PIL_Image'] = Image
+  except Exception:
+    mod['pytesseract'] = None
+    mod['PIL_Image'] = None
+  return mod
+
+_IM = _try_imports()
+
+async def _fetch_pdf_bytes(url: str) -> bytes | None:
+  try:
+    async with httpx.AsyncClient(timeout=20.0, follow_redirects=True) as hx:
+      r = await hx.get(url); r.raise_for_status()
+      return r.content
+  except Exception:
+    return None
+
+def _tok(s:str)->set:
+  return set(re.findall(r"[a-z0-9]+", (s or "").lower()))
+
+def _relevance_score(p:dict, must: set, nice: set) -> int:
+  title = (p.get("title") or "")
+  venue = ((p.get("primary_location") or {}).get("source") or {}).get("display_name","")
+  inv = (p.get("abstract_inverted_index") or {})
+  abstract = " ".join(inv.keys()) if isinstance(inv, dict) else ""
+  bag = _tok(title + " " + venue + " " + abstract)
+  score = 0
+  score += 10*len(must & bag)
+  score += 2*len(nice & bag)
+  return score
+
+async def _open_access_hits(q: str, per: int = 8, seed:int=0, diversify:bool=False) -> List[dict]:
+  """Recent OA (pref PDF) with strict->relaxed passes, expanded queries, and DLP/SaaS relevance ranking (+diversity)."""
   url = "https://api.openalex.org/works"
   now = datetime.date.today()
   start = f"{now.year-4}-01-01"
-  params = {
-    "search": q,
-    "filter": f"from_publication_date:{start},language:en,primary_location.source.type:journal",
-    "sort": "publication_date:desc",
-    "per_page": per
-  }
+
+  must = _tok("data loss prevention saas")
+  nice = _tok("policy engine classifier quarantine allow cloud security zero trust access control dlp")
+
+  base = _normalize_for_oa(q) or [q]
+  extra = [
+    "data loss prevention SaaS",
+    "cloud DLP policy engine",
+    "SaaS security data exfiltration",
+    "content classification policy quarantine"
+  ]
+  queries = []
+  [queries.append(x) for x in (base[:2] + extra) if x not in queries]
+  queries = _uniq(queries)
+  queries = _shuffle_with_seed(queries, seed, diversify)
+
+  async def _hit_once(hx, search: str, relax: bool) -> List[dict]:
+    params = {
+      "search": search,
+      "filter": f"from_publication_date:{start},language:en" + (",primary_location.source.type:journal" if not relax else ""),
+      "sort": "publication_date:desc",
+      "per_page": max(per, 20)
+    }
+    r = await hx.get(url, params=params); r.raise_for_status()
+    return r.json().get("results", []) or []
+
+  results = []
   try:
-    async with httpx.AsyncClient(timeout=14.0) as hx:
-      r = await hx.get(url, params=params); r.raise_for_status()
-      res = r.json().get("results", [])
+    async with httpx.AsyncClient(timeout=16.0) as hx:
+      for relax in (False, True):
+        for q1 in queries:
+          try:
+            got = await _hit_once(hx, q1, relax=relax)
+            if got: results.extend(got)
+          except Exception:
+            continue
+        if results: break
   except Exception:
-    return []
+    results = []
+
+  ranked = []
+  for w in results:
+    loc = (w.get("primary_location") or {})
+    oa  = (w.get("open_access") or {})
+    pdf_url = loc.get("pdf_url") or oa.get("oa_url") or ""
+    if not pdf_url: continue
+    ranked.append((_relevance_score(w, must, nice), w, pdf_url))
+
+  ranked.sort(key=lambda t: -t[0])
+  ranked = [t for t in ranked if t[0] >= 10] or ranked
+
   out = []
-  for w in res:
-    loc = w.get("primary_location",{}) or {}
-    oa = w.get("open_access",{}) or {}
-    url_pdf = (loc.get("pdf_url") or oa.get("oa_url") or "")
+  for sc, w, pdf_url in ranked[:per]:
+    loc = (w.get("primary_location") or {})
+    src = (loc.get("source") or {})
     out.append({
       "title": w.get("title") or "(untitled)",
       "year": w.get("publication_year") or "",
-      "venue": (loc.get("source",{}) or {}).get("display_name"),
-      "url": loc.get("landing_page_url") or oa.get("oa_url") or w.get("id"),
-      "pdf": url_pdf if (url_pdf and url_pdf.lower().endswith(".pdf")) else "",
+      "venue": src.get("display_name"),
+      "pdf": pdf_url,
+      "url": loc.get("landing_page_url") or (w.get("open_access") or {}).get("oa_url") or w.get("id"),
       "authors": ", ".join(a.get("author",{}).get("display_name","") for a in (w.get("authorships") or [])[:4])
     })
-  return [h for h in out if h.get("pdf")]
+  return out
 
 def _split_blocks(txt: str) -> List[str]:
   txt = re.sub(r"\s+", " ", txt or "").strip()
@@ -534,13 +924,19 @@ def _fig_captions(raw: str) -> List[str]:
   caps = re.findall(r"(?:Figure|Fig\.?)\s*\d+[:\.\)]\s*[^\n\.]+(?:\.[^\n\.]+)?", raw, flags=re.I)
   return [c.strip() for c in caps][:40]
 
-def _rank_snippets(q: str, snippets: List[str], k: int = 10) -> List[dict]:
+def _rank_snippets(q: str, snippets: List[str], k: int = 10, seed:int=0, diversify:bool=False) -> List[dict]:
+  def _jitter(x, r, do):
+    return x + (r.uniform(-1e-3, 1e-3) if do else 0.0)
+
+  r = _rng(seed)
   try:
     from sklearn.feature_extraction.text import TfidfVectorizer
     import numpy as np
     vec = TfidfVectorizer(stop_words="english", max_features=8000)
     X = vec.fit_transform(snippets + [q])
     sims = (X[:-1] @ X[-1].T).toarray().ravel()
+    if diversify:
+      sims = np.array([_jitter(float(s), r, True) for s in sims])
     idx = np.argsort(-sims)[:k]
     return [{"i": int(i), "text": snippets[int(i)], "score": float(sims[int(i)])} for i in idx]
   except Exception:
@@ -549,6 +945,8 @@ def _rank_snippets(q: str, snippets: List[str], k: int = 10) -> List[dict]:
     for i, s in enumerate(snippets):
       sl = set(re.findall(r"[a-z0-9]+", s.lower()))
       scored.append((i, len(ql & sl)))
+    if diversify:
+      scored = [(i, sc + r.random()*1e-3) for i, sc in scored]
     scored.sort(key=lambda t: -t[1])
     return [{"i": i, "text": snippets[i], "score": float(sc)} for i, sc in scored[:k]]
 
@@ -564,7 +962,8 @@ async def _fetch_pdf_text(url: str) -> str:
     if PdfReader is not None:
       reader = PdfReader(io.BytesIO(b))
       for p in reader.pages[:20]: txt += (p.extract_text() or "") + "\n"
-    elif 'fitz' in globals() and fitz is not None:
+    elif _IM['fitz']:
+      fitz = _IM['fitz']
       doc = fitz.open(stream=b, filetype="pdf")
       for i, page in enumerate(doc):
         if i >= 20: break
@@ -573,27 +972,104 @@ async def _fetch_pdf_text(url: str) -> str:
     pass
   return txt
 
+async def _fetch_pdf_figures(url: str, max_pages: int = 12, max_imgs: int = 12) -> List[dict]:
+  """Return list of {'page':i,'caption':str,'png_b64':str,'ocr':str} from PDF."""
+  out: List[dict] = []
+  if not _IM['fitz']:  # PyMuPDF not available
+    return out
+  b = await _fetch_pdf_bytes(url)
+  if not b: return out
+  try:
+    fitz = _IM['fitz']
+    doc = fitz.open(stream=b, filetype="pdf")
+    img_count = 0
+    for i, page in enumerate(doc):
+      if i >= max_pages or img_count >= max_imgs: break
+      for img in page.get_images(full=True):
+        if img_count >= max_imgs: break
+        xref = img[0]
+        pix = fitz.Pixmap(doc, xref)
+        if pix.n >= 4:
+          pix = fitz.Pixmap(fitz.csRGB, pix)
+        png_b = pix.tobytes("png")
+        png_b64 = "data:image/png;base64," + base64.b64encode(png_b).decode("ascii")
+        text = (page.get_text() or "")
+        cap = ""
+        m = re.search(r"(Figure|Fig\.?)\s*\d+[:\.\)]\s*[^\n\.]+", text, flags=re.I)
+        if m: cap = m.group(0).strip()
+        ocr = ""
+        if _IM['pytesseract'] and _IM['PIL_Image']:
+          try:
+            from PIL import Image as PILImage
+            import io as _io
+            ocr = _IM['pytesseract'].image_to_string(PILImage.open(_io.BytesIO(png_b)))[:300]
+          except Exception:
+            ocr = ""
+        out.append({"page": i+1, "caption": cap, "png_b64": png_b64, "ocr": ocr})
+        img_count += 1
+  except Exception:
+    pass
+  return out
+
 GROUNDED_RULES = (
-  "Use provided snippets to synthesize a small Mermaid diagram (5–8 nodes, LR) with 2–4 dashed control nodes."
-  " Output JSON: {mermaid:string, summary:string, cites:number[]}."
-  " Each node/edge choice must be inferable from snippets; cite with indices in 'cites' and reference them inline as [#] in the summary."
-  " Do not invent procedures; defense-only. If snippets are insufficient, say so and set mermaid to ''."
+  "Use provided snippets and figure captions/OCR to synthesize a small Mermaid flowchart (5–8 nodes, LR). "
+  "Prefer structure suggested by figure captions. Include 2–4 dashed control nodes. "
+  "Output JSON: {mermaid:string, summary:string, cites:number[]}. "
+  "Each node/edge must be inferable from snippets/figures; cite indices in 'cites' and reference them inline as [#] in the summary. "
+  "Use exact nouns from captions where reasonable. Defense-only. If insufficient evidence, return mermaid:'' and a brief reason."
 )
 
 @router.post("/diagram/grounded")
 async def diagram_grounded(payload:dict=Body(...)):
   q = (payload or {}).get("q") or ""
+  n = int((payload or {}).get("n") or 1)
+  seed = int((payload or {}).get("seed") or 0)
+  diversify = bool((payload or {}).get("diversify") or False)
+  temp = float((payload or {}).get("temp") or 0.2)  # 0.2–0.9
+
   if _risky(q): return JSONResponse({"ok":False,"error":"Blocked for safety."}, status_code=400)
 
-  hits = await _open_access_hits(q, per=8)
-  if not hits: return JSONResponse({"ok":False,"error":"No OA PDFs found"}, status_code=404)
+  hits = await _open_access_hits(q, per=8, seed=seed, diversify=diversify)
+
+  if not hits:
+    mer, summ = _llm_mermaid_plan(q)
+    return JSONResponse({
+      "ok": True,
+      "mermaid": mer,
+      "summary": "(Fallback: no_oa_pdfs) " + (summ or "Synthesized without OA PDFs."),
+      "cites": [],
+      "snippets": [],
+      "sources": []
+    })
 
   texts = []
   for h in hits[:3]:
     t = await _fetch_pdf_text(h["pdf"])
     if t: texts.append((h, t))
 
-  if not texts: return JSONResponse({"ok":False,"error":"Could not extract text from OA PDFs"}, status_code=502)
+  if not texts:
+    mer, summ = _llm_mermaid_plan(q)
+    return JSONResponse({
+      "ok": True,
+      "mermaid": mer,
+      "summary": "(Fallback: no_oa_text) " + (summ or "Synthesized without extracted PDF text."),
+      "cites": [],
+      "snippets": [],
+      "sources": hits
+    })
+
+  # ---- figure extraction & bias ----
+  figs_all: List[dict] = []
+  for h, _ in texts:
+    try:
+      figs = await _fetch_pdf_figures(h["pdf"])
+    except Exception:
+      figs = []
+    if figs:
+      for f in figs[:6 - len(figs_all)]:
+        figs_all.append({"paper": h["title"], **f})
+        if len(figs_all) >= 6: break
+    if len(figs_all) >= 6: break
 
   pool = []
   for h, t in texts:
@@ -601,22 +1077,70 @@ async def diagram_grounded(payload:dict=Body(...)):
     blks = _split_blocks(t)
     pool.extend([f"[cap] {c}" for c in caps] + blks)
 
-  top = _rank_snippets(q, pool, k=10)
-  bundle = {"query": q, "snippets": [{"idx": s["i"], "text": s["text"]} for s in top]}
+  if figs_all:
+    for fi in figs_all:
+      if fi.get("caption"):
+        pool.insert(0, f"[figcap p{fi['page']}] {fi['caption']}")
+      if fi.get("ocr"):
+        pool.insert(0, f"[figocr p{fi['page']}] {fi['ocr']}")
+
+  top = _rank_snippets(q, pool, k=10, seed=seed, diversify=diversify)
+  bundle = {
+    "query": q,
+    "snippets": [{"idx": s["i"], "text": s["text"]} for s in top],
+    "figures": [{"page": f["page"], "caption": f["caption"]} for f in figs_all]
+  }
 
   try:
-    user = json.dumps(bundle, ensure_ascii=False)
-    res = gen_json(GROUNDED_RULES, user, model=MODEL) or {}
-    mer = _sanitize_mermaid((res or {}).get("mermaid") or "")
-    summ = (res or {}).get("summary") or ""
-    cites = (res or {}).get("cites") or []
+    def _one_variant(bundle, seed_offset=0):
+      user = json.dumps(bundle, ensure_ascii=False)
+      rules = GROUNDED_RULES + f" (variation_seed={seed+seed_offset})"
+      res = gen_json(rules, user, model=MODEL, temperature=temp) or {}
+      mer = _repair_mermaid((res or {}).get("mermaid") or "") or _ascii_to_mermaid((res.get("summary") or ""))
+      return {
+        "mermaid": mer,
+        "summary": (res or {}).get("summary") or "",
+        "cites": (res or {}).get("cites") or []
+      }
+
+    variants = []
+    for i in range(max(1, n)):
+      variants.append(_one_variant(bundle, seed_offset=i))
+
+    # pick first non-empty as primary
+    best = next((v for v in variants if v["mermaid"]), variants[0])
+    mer = best["mermaid"]
+    summ = best["summary"]
+    cites = best["cites"]
+
+    # --- Always-give-something fallback for clear DLP-SaaS prompts ---
+    ql = (q or "").lower()
+    wants_dlp = ("data loss prevention" in ql or "dlp" in ql) and ("saas" in ql)
+    describes_flow = ("->" in q) or (" to " in ql and "policy" in ql and ("quarantine" in ql or "allow" in ql))
+    if not mer and (wants_dlp or describes_flow):
+      mer = _diagram_dlp()
+      summ = "(Fallback: dlp_seed) Seeded DLP pipeline rendered due to low-evidence OA results."
+
     return JSONResponse({
       "ok": True,
       "mermaid": mer,
       "summary": summ,
       "cites": cites,
       "snippets": bundle["snippets"],
-      "sources": hits  # show which PDFs were used
+      "figures": figs_all,
+      "sources": hits,
+      "alternatives": variants  # NEW
     })
   except Exception as e:
-    return JSONResponse({"ok":False,"error":f"llm: {e}"}, status_code=500)
+    mer_fb, sum_fb = _llm_mermaid_plan(q, req_labels=None)
+    srcs = await _scholar_search((_normalize_for_oa(q)[0] if _normalize_for_oa(q) else q), per=5)
+    return JSONResponse({
+      "ok": True,
+      "mermaid": mer_fb,
+      "summary": "(Fallback: grounded_llm_error) " + (sum_fb or "Synthesized from model priors."),
+      "cites": [],
+      "snippets": [],
+      "figures": [],
+      "sources": srcs,
+      "fallback": "grounded_llm_error"
+    })
