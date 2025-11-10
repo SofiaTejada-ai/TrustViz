@@ -3,19 +3,29 @@
 # + Export endpoint (SVG/PNG) with optional light branding (does not alter LLM/grounded flow)
 # + FIX: preserve subgraph/style/class lines and hex colors so yellow “Controls” box renders
 
+# trustviz/server/studio_routes.py — ScholarViz (LLM→Mermaid + sources + robust OA + grounded fallback)
+# + Diversity knobs: n, seed, diversify, temp
+# + Export endpoint (SVG/PNG) with optional light branding
+# + FIX: preserve subgraph/style/class lines and hex colors
+
+from __future__ import annotations
+
 import os, re, io, json, html, base64, datetime, random
 from typing import List, Tuple
 
 from fastapi import APIRouter, Body, UploadFile, File, Request, Query
-from fastapi.responses import HTMLResponse, JSONResponse, Response  # added Response
+from fastapi.responses import HTMLResponse, JSONResponse, Response
 from pypdf import PdfReader
 import httpx
 
 from trustviz.llm.gemini_client import gen_text, gen_json
 from trustviz.notebook.runner import NotebookRunner
 
-router = APIRouter()
+router = APIRouter(tags=["scholarviz"])
 MODEL = os.environ.get("TRUSTVIZ_LLM_MODEL", "gemini-2.5-pro")
+
+# …rest of your ScholarViz endpoints here (NO include_router calls) …
+
 
 # ---------- safety ----------
 _DENY = [
@@ -469,6 +479,10 @@ def diagram_ask(payload:dict=Body(...)):
   except Exception as e:
     return JSONResponse({"ok":False,"error":f"llm: {e}"}, status_code=500)
 
+
+# Put near other helpers in studio_routes.py
+
+
 # ---------- notebook & docs ----------
 @router.get("/notebook/templates")
 def notebook_templates():
@@ -772,7 +786,6 @@ document.getElementById('ask_to_nb').onclick = ()=>{
 };
 
 document.getElementById('plan_go').onclick = async ()=>{
-  document.getElementById('plan_grounded').click();
   const q = document.getElementById('plan_q').value.trim();
   document.getElementById('plan_sum').textContent='…';
   const d = await post('/diagram/plan', {q});
@@ -812,6 +825,7 @@ document.getElementById('plan_grounded').onclick = async ()=>{
   const rawPre  = document.getElementById('mer_raw');
   const figsDiv = document.getElementById('fig_thumbs');
   out.textContent = 'Fetching OA PDFs and synthesizing…';
+  // document.getElementById('plan_grounded').click();
   figsDiv.innerHTML = '';
   try{
     const d = await fetch('/diagram/grounded', {
@@ -1088,7 +1102,7 @@ async def _open_access_hits(q: str, per: int = 8, seed:int=0, diversify:bool=Fal
 def _split_blocks(txt: str) -> List[str]:
   txt = re.sub(r"\s+", " ", txt or "").strip()
   blocks = re.split(r"(?<=\.)\s{2,}|(?:\n\s*){2,}", txt)
-  return [b.strip() for b in blocks if len(b.strip()) > 120][:120]
+  return [b.strip() for b in blocks if len(b.strip()) > 120]
 
 def _fig_captions(raw: str) -> List[str]:
   caps = re.findall(r"(?:Figure|Fig\.?)\s*\d+[:\.\)]\s*[^\n\.]+(?:\.[^\n\.]+)?", raw, flags=re.I)
@@ -1142,7 +1156,7 @@ async def _fetch_pdf_text(url: str) -> str:
     pass
   return txt
 
-async def _fetch_pdf_figures(url: str, max_pages: int = 12, max_imgs: int = 12) -> List[dict]:
+async def _fetch_pdf_figures(url: str, max_pages: int =12, max_imgs: int = 12) -> List[dict]:
   """Return list of {'page':i,'caption':str,'png_b64':str,'ocr':str} from PDF."""
   out: List[dict] = []
   if not _IM['fitz']:  # PyMuPDF not available
@@ -1192,6 +1206,8 @@ GROUNDED_RULES = (
 @router.post("/diagram/grounded")
 async def diagram_grounded(payload:dict=Body(...)):
   q = (payload or {}).get("q") or ""
+  fast = bool((payload or {}).get("fast"))  # <<< NEW
+  per = 3 if fast else 8  # <<< NEW
   n = int((payload or {}).get("n") or 1)
   seed = int((payload or {}).get("seed") or 0)
   diversify = bool((payload or {}).get("diversify") or False)

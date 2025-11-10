@@ -3,11 +3,7 @@
 3. uvicorn trustviz.server.app:app --host 127.0.0.1 --port 8000 --reload
 4. If #3 doesn't work, load everything from requirements.tx
 source .venv/bin/activate
-
-# Upgrade build tooling
 python -m pip install --upgrade pip setuptools wheel
-
-# Install dependencies
 pip install -r requirements.txt
 
 
