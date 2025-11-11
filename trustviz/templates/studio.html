@@ -1,0 +1,22 @@
+<div id="lesson" style="margin-top:16px">
+  <div id="lessonTitle" style="font-weight:600;margin-bottom:8px;"></div>
+  <div id="lessonNote" style="margin:8px 0 12px;"></div>
+  <div id="lessonQuiz" style="display:none;margin-top:8px;"></div>
+  <div style="margin-top:10px;">
+    <button id="lessonPrev">◀</button>
+    <button id="lessonNext">▶</button>
+  </div>
+</div>
+
+<!-- Add a button near your Plan/Grounded buttons -->
+<button onclick="window.TrustViz.initLessonPlayer()">Animate Lesson</button>
+<script src="https://unpkg.com/cytoscape@3/dist/cytoscape.min.js"></script>
+
+<!-- Your module import (HTML, not JS file) -->
+<script type="module">
+  import { initLessonPlayer } from "/static/lesson_player.js";
+  window.TrustViz = window.TrustViz || {};
+  window.TrustViz.initLessonPlayer = initLessonPlayer;
+</script>
+</body>
+</html>

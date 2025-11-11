@@ -227,16 +227,43 @@ def _strip_fences(s:str)->str:
 # keep LR; normalize "graph" to "flowchart"
 def _coerce_flowchart_lr(s: str) -> str:
   s = (s or "").strip()
-  s = re.sub(r"(?i)^\s*graph\b", "flowchart", s)
-  if not re.match(r"(?i)^\s*flowchart\s+LR\b", s):
-    if s.lower().startswith("flowchart"):
-      s = re.sub(r"(?i)^\s*flowchart\b.*", "flowchart LR", s, count=1)
-    else:
-      s = "flowchart LR\n" + s
-  return s
+  if not s:
+    return "flowchart LR"
+  lines = s.splitlines()
+  first = lines[0].strip()
+
+  # match "graph|flowchart  DIR  [rest-of-line...]"
+  m = re.match(r"(?i)^\s*(graph|flowchart)\s+(LR|RL|TB|BT)\b(.*)$", first)
+  if m:
+    rest = (m.group(3) or "").strip()
+    new_lines = ["flowchart LR"]
+    if rest:
+      new_lines.append(rest)  # keep same-line content!
+    new_lines.extend(lines[1:])
+    return "\n".join(new_lines)
+
+  # If first line doesn't start with a header, add ours and keep everything else.
+  if not re.match(r"(?i)^\s*(graph|flowchart)\b", first):
+    return "flowchart LR\n" + s
+
+  # It's some odd header; normalize to flowchart LR and keep the rest intact
+  lines[0] = "flowchart LR"
+  return "\n".join(lines)
 
 def _normalize_arrows(s: str) -> str:
   return (s or "").replace("–>", "->").replace("—>", "->").replace("⇒", "->").replace("→", "->")
+def _strip_inline_headers(s: str) -> str:
+  # Remove accidental "graph LR"/"flowchart LR" tokens that appear mid-line
+  # but keep proper header on the first line.
+  def _clean_line(i, line):
+    if i == 0:
+      return line  # header is handled elsewhere
+    line = re.sub(r"(?i)\bgraph\s+(LR|RL|TB|BT)\b", "", line)
+    line = re.sub(r"(?i)\bflowchart\s+(LR|RL|TB|BT)\b", "", line)
+    return re.sub(r"\s{2,}", " ", line).strip()
+
+  lines = (s or "").splitlines()
+  return "\n".join(_clean_line(i, ln) for i, ln in enumerate(lines))
 
 # FIX 2: keep subgraph/style/class lines during trimming
 def _trim_extraneous_text(s: str) -> str:
@@ -256,11 +283,54 @@ def _trim_extraneous_text(s: str) -> str:
       continue
   return "\n".join(out).strip()
 
+# --- PATCHED: tolerant plausibility check ---
 def _is_plausible_mermaid(s: str) -> bool:
-  if not s or "flowchart" not in s: return False
+  if not s or "flowchart" not in (s or "").lower():
+    return False
+  # Accept subgraph/style/class/linkStyle presence with any node or any edge
+  if any(k in s for k in ("subgraph", "classDef", "style", "linkStyle")):
+    if re.search(r"\b[A-Za-z0-9_]+\s*[\[\(][^\]\)]+[\]\)]", s): return True
+    if "->" in s or "-.->" in s: return True
+  # Default rule: need at least one edge and two node defs
   if "->" not in s and "-.->" not in s: return False
   nodes = re.findall(r"\b[A-Za-z0-9_]+\s*[\[\(][^\]\)]+[\]\)]", s)
   return len(nodes) >= 2
+
+# ---------- NEW: tiny synthesis helpers (final-resort diagram) ----------
+_WORDS = re.compile(r"[A-Za-z][A-Za-z0-9+\-/ ]{1,40}")
+
+def _pick_labels_from_text(t: str, k: int = 6) -> list[str]:
+    t = (t or "").replace("\n", " ")
+    toks = _WORDS.findall(t)
+    bad = {"the","and","with","that","this","they","these","those","which",
+           "into","from","over","under","using","based","since","because",
+           "are","is","be","been","being","for","to","of","in","on","as"}
+    freq = {}
+    for w in toks:
+        w2 = w.strip().strip("-/").strip()
+        lw = w2.lower()
+        if len(w2) < 3 or lw in bad:
+            continue
+        freq[w2] = freq.get(w2, 0) + 1
+    scored = sorted(freq.items(), key=lambda kv: (-(kv[1] + 0.1*(1 if " " in kv[0] else 0)), -len(kv[0])))
+    return [w for w, _ in scored[:k]]
+
+def _skeleton_from_text(t: str) -> str:
+    labs = _pick_labels_from_text(t, k=7)
+    if len(labs) < 3:
+        labs = (labs + ["Inputs","Processing","Outputs"])[:5]
+    lines = ["flowchart LR"]
+    ids = []
+    for i, lab in enumerate(labs):
+        nid = f"N{i+1}"
+        ids.append(nid)
+        lines.append(f'{nid}[{lab[:40]}]')
+    for i in range(len(ids)-1):
+        lines.append(f"{ids[i]} --> {ids[i+1]}")
+    if len(ids) >= 4:
+        lines.append(f"{ids[0]} -.-> {ids[2]}")
+        lines.append(f"{ids[1]} -.-> {ids[3]}")
+    return "\n".join(lines)
 
 # FIX 3: don’t purge subgraph/style lines; avoid auto-node-defs when subgraphs are present
 def _repair_mermaid(src: str) -> str:
@@ -268,6 +338,7 @@ def _repair_mermaid(src: str) -> str:
   s = _trim_extraneous_text(s)
   s = _coerce_flowchart_lr(s)
   s = _normalize_arrows(s)
+  s = _strip_inline_headers(s)   # <<< ADD THIS LINE
   s = _sanitize_mermaid(s)
 
   has_subgraph = bool(re.search(r"(?i)^\s*subgraph\b", s, re.M))
@@ -307,7 +378,9 @@ def _repair_mermaid(src: str) -> str:
       ascii_try += "\nclassDef dashed stroke-dasharray: 4 3,stroke:#888,color:#555;"
     return ascii_try
 
-  return ""  # final safe fallback
+  # NEW: final safety net – synthesize a tiny skeleton from the text
+  synth = _skeleton_from_text(src or "")
+  return synth if _is_plausible_mermaid(synth) else ""
 
 # ---------- LLM → Mermaid synthesizer (few-shot primed) ----------
 _FEWSHOT = [
@@ -429,7 +502,14 @@ async def diagram_plan(payload:dict=Body(...)):
         res = gen_json(GROUNDED_RULES, json.dumps(bundle, ensure_ascii=False), model=MODEL) or {}
         mer = _repair_mermaid((res or {}).get("mermaid") or "") or _ascii_to_mermaid((res.get("summary") or ""))
         summ = (res or {}).get("summary") or ""
-        return JSONResponse({"ok": True, "make_diagram": bool(mer), "mermaid": mer, "summary": summ, "sources": hits})
+        if not mer:
+          # last resort: synthesize from best evidence
+          seed_text = " ".join(s["text"] for s in bundle["snippets"][:6])
+          mer = _skeleton_from_text(seed_text)
+        if not _is_plausible_mermaid(mer):
+          mer = _default_mermaid()
+        srcs = hits
+        return JSONResponse({"ok": True, "make_diagram": True, "mermaid": mer, "summary": summ, "sources": srcs})
 
   if "cia triad" in ql or ("confidentiality" in ql and "integrity" in ql and "availability" in ql):
     mer = _diagram_cia()
@@ -455,12 +535,18 @@ async def diagram_plan(payload:dict=Body(...)):
     if not mer and dlp_preseed:
       mer = dlp_preseed
     if not mer:
+      # last resort: synthesize from the user query itself
+      mer = _skeleton_from_text(q)
+
+    make = bool(_is_plausible_mermaid(mer))
+    if not make:
       mer = _default_mermaid()
+      make = True
 
     q_norms = _normalize_for_oa(q)
     srcs = await _scholar_search((q_norms[0] if q_norms else q), per=5)
     summary = llm_sum or ("Data Loss Prevention pipeline with policy enforcement and mitigations." if dlp_preseed else "")
-    return JSONResponse({"ok":True,"make_diagram":bool(mer), "mermaid": mer, "summary": summary, "sources": srcs})
+    return JSONResponse({"ok":True,"make_diagram":make, "mermaid": mer, "summary": summary, "sources": srcs})
 
   except Exception as e:
     return JSONResponse({"ok":False,"error":f"llm: {e}"}, status_code=500)
@@ -684,6 +770,27 @@ button{background:#111827;color:#fff;border:none;border-radius:8px;padding:8px 1
   <div id="fig_thumbs" style="margin-top:10px"></div>
 </div>
 
+<!-- === PATCH: Animated Lesson (zyBooks-style) ============================ -->
+<div class="card">
+  <h3 style="margin:0 0 8px">Animated Lesson</h3>
+
+  <!-- Cytoscape canvas (separate from Mermaid) -->
+  <div id="diagram_cy" style="height:360px;border:1px solid #e5e7eb;border-radius:12px;display:none;margin-bottom:10px"></div>
+
+  <div id="lesson" style="margin-top:6px">
+    <div id="lessonTitle" style="font-weight:600;margin-bottom:8px;"></div>
+    <div id="lessonNote" style="margin:8px 0 12px;"></div>
+    <div id="lessonQuiz" style="display:none;margin-top:8px;"></div>
+    <div style="margin-top:10px;">
+      <button id="lessonPrev">◀</button>
+      <button id="lessonNext">▶</button>
+      <button id="lessonStart" style="margin-left:8px">Animate Lesson</button>
+      <small style="color:#6b7280;margin-left:8px">Uses the text in “Plan a Diagram”</small>
+    </div>
+  </div>
+</div>
+<!-- === /PATCH ============================================================ -->
+
 <div class="card">
   <h3 style="margin:0 0 8px">Ask about this Diagram</h3>
   <div style="display:flex;gap:8px;flex-wrap:wrap">
@@ -724,7 +831,7 @@ let CURRENT_MERMAID = null;
 let LAST_SOURCES = [];
 
 async function post(path, body, form){
-  const res = await fetch(path, {method:'POST', headers: form?undefined:{'Content-Type':'application/json'}, body: form?body:JSON.stringify(body||{})});
+  const res = await fetch(path, {method:'POST', headers: form?undefined:{'Content-Type':'application/json'}, body: form?JSON.stringify(body||{}):JSON.stringify(body||{})});
   return res.json();
 }
 function renderSources(el, src){
@@ -739,6 +846,28 @@ function currentSVGString(){
   if (!/xmlns=/.test(s)) s = s.replace('<svg', '<svg xmlns="http://www.w3.org/2000/svg"');
   return s;
 }
+
+// --- Lesson teardown so the page returns to normal --------------------------
+function teardownLesson(){
+  // Hide cy canvas + remove any dim/children
+  const cyDiv = document.getElementById('diagram_cy');
+  if (cyDiv){
+    cyDiv.style.display = 'none';
+    // remove the blue dim layer if present
+    const dim = document.getElementById('lessonDim');
+    if (dim) dim.remove();
+    // wipe Cytoscape instance if the module left one
+    if (window.cy && typeof window.cy.destroy === 'function'){
+      try { window.cy.destroy(); } catch(_){}
+    }
+    // empty container to avoid stale nodes
+    cyDiv.innerHTML = '';
+  }
+  // Show Mermaid area again
+  const merDiv = document.getElementById('diagram_view');
+  if (merDiv) merDiv.style.display = 'block';
+}
+// ---------------------------------------------------------------------------
 
 async function exportDiagram(fmt){
   const svg = currentSVGString();
@@ -786,6 +915,7 @@ document.getElementById('ask_to_nb').onclick = ()=>{
 };
 
 document.getElementById('plan_go').onclick = async ()=>{
+  teardownLesson();                     // <<< added
   const q = document.getElementById('plan_q').value.trim();
   document.getElementById('plan_sum').textContent='…';
   const d = await post('/diagram/plan', {q});
@@ -818,6 +948,7 @@ document.getElementById('plan_go').onclick = async ()=>{
 };
 
 document.getElementById('plan_grounded').onclick = async ()=>{
+  teardownLesson();                     // <<< added
   const q = document.getElementById('plan_q').value.trim();
   const out = document.getElementById('plan_g_out');
   const view = document.getElementById('diagram_view');
@@ -956,6 +1087,15 @@ document.getElementById('doc_sum').onclick = async ()=>{
   };
 })();
 </script>
+
+<!-- === PATCH: Cytoscape + lesson player wiring ========================== -->
+<script src="https://unpkg.com/cytoscape@3/dist/cytoscape.min.js"></script>
+<script type="module">
+  import { initLessonPlayer } from "/static/lesson_player.js";
+  document.getElementById("lessonStart").onclick = () => initLessonPlayer({ useMermaid: true });
+</script>
+<!-- === /PATCH =========================================================== -->
+
 </body></html>
 """
   return HTMLResponse(page)
@@ -1219,6 +1359,10 @@ async def diagram_grounded(payload:dict=Body(...)):
 
   if not hits:
     mer, summ = _llm_mermaid_plan(q)
+    if not mer:
+      mer = _skeleton_from_text(q)
+    if not _is_plausible_mermaid(mer):
+      mer = _default_mermaid()
     return JSONResponse({
       "ok": True,
       "mermaid": mer,
@@ -1235,6 +1379,10 @@ async def diagram_grounded(payload:dict=Body(...)):
 
   if not texts:
     mer, summ = _llm_mermaid_plan(q)
+    if not mer:
+      mer = _skeleton_from_text(q)
+    if not _is_plausible_mermaid(mer):
+      mer = _default_mermaid()
     return JSONResponse({
       "ok": True,
       "mermaid": mer,
@@ -1307,6 +1455,13 @@ async def diagram_grounded(payload:dict=Body(...)):
       mer = _diagram_dlp()
       summ = "(Fallback: dlp_seed) Seeded DLP pipeline rendered due to low-evidence OA results."
 
+    # NEW: ensure we always return a drawable diagram
+    if not mer:
+      seed_text = " ".join(s.get("text","") for s in bundle["snippets"][:6]) or q
+      mer = _skeleton_from_text(seed_text)
+    if not _is_plausible_mermaid(mer):
+      mer = _default_mermaid()
+
     return JSONResponse({
       "ok": True,
       "mermaid": mer,
@@ -1319,6 +1474,10 @@ async def diagram_grounded(payload:dict=Body(...)):
     })
   except Exception as e:
     mer_fb, sum_fb = _llm_mermaid_plan(q, req_labels=None)
+    if not mer_fb:
+      mer_fb = _skeleton_from_text(q)
+    if not _is_plausible_mermaid(mer_fb):
+      mer_fb = _default_mermaid()
     srcs = await _scholar_search((_normalize_for_oa(q)[0] if _normalize_for_oa(q) else q), per=5)
     return JSONResponse({
       "ok": True,
