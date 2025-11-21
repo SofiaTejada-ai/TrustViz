@@ -26,6 +26,8 @@ MODEL = os.environ.get("TRUSTVIZ_LLM_MODEL", "gemini-2.5-pro")
 
 # …rest of your ScholarViz endpoints here (NO include_router calls) …
 
+
+# ---------- safety ----------
 _DENY = [
   r"\b(ddos|dos)\b", r"\b(botnet|c2|command\s*and\s*control)\b", r"\b(keylogger|rootkit|rat)\b",
   r"\bzero[-\s]?day\b", r"\bexploit\s+code\b", r"\bcredential\s+stuffing\b", r"\bphishing\s+kit\b",
@@ -36,6 +38,7 @@ USE_GROUNDED_DEFAULT = True
 
 def _risky(s:str)->bool: return any(re.search(p,(s or "").lower()) for p in _DENY)
 
+# ---------- mermaid allowlist/sanitize ----------
 _ALLOWED = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789[]()_:.-> \n|/%'\",+&?-#;")
 def _sanitize_mermaid(s:str)->str:
   return "".join(ch for ch in (s or "") if ch in _ALLOWED)
@@ -64,16 +67,19 @@ def _default_mermaid()->str:
           "  D --> K[Key Controls]\n"
           "  K --> O[Outcomes]\n")
 
+# ---------- OA query normalization ----------
 def _normalize_for_oa(q: str) -> List[str]:
   if not q: return []
   q0 = re.sub(r"[“”‘’\"'’→⇒—–\-–>]+", " ", q)
   q0 = re.sub(r"[^A-Za-z0-9\s\+\.]", " ", q0)
   q0 = re.sub(r"\s+", " ", q0).strip()
+
   lower = q0.lower()
   expanded = lower
   expanded = expanded.replace("dlp", "data loss prevention")
   expanded = expanded.replace("saas", "software as a service")
   expanded = expanded.replace("zero trust", "zero trust architecture")
+
   tiers = []
   tiers.append(expanded)
   if "data loss prevention" in expanded or "dlp" in lower:
@@ -81,12 +87,14 @@ def _normalize_for_oa(q: str) -> List[str]:
   if "software as a service" in expanded or "saas" in lower:
     tiers.append("cloud security SaaS policy engine content inspection classification")
   tiers.append(re.sub(r"\b(users?|apps?|classifiers?|policy|quarantine|allow)\b", "", expanded).strip())
+
   out = []
   for t in tiers:
     t = re.sub(r"\s+", " ", t).strip()
     if t and t not in out: out.append(t)
   return [o for o in out if o]
 
+# ---------- sources (OpenAlex) ----------
 async def _scholar_search(q:str, per:int=5)->List[dict]:
   now = datetime.date.today()
   start = f"{now.year-3}-01-01"
@@ -122,6 +130,7 @@ def _labels_from_mermaid(src:str)->List[str]:
     if t and t not in seen: seen.add(t); labs.append(t)
   return labs[:20]
 
+# ---------- special diagrams (deterministic fallbacks) ----------
 def _diagram_cia()->str:
   return _sanitize_mermaid("""flowchart LR
 C[Confidentiality] --> P1[Access Control]
@@ -154,6 +163,7 @@ Po -.-> Aud[Audit / Alerts]
 C -.-> Enc[Encryption at Rest/In Transit]
 """)
 
+# ---------- ASCII ("A -> B : label") to Mermaid ----------
 _ASCII_ARROW_LINE = re.compile(r"^\s*([^#\-\*].*?)\s*(-{1,2}|=|–|—)?>\s*(.+)$")
 _ARROWS = ("->", "-->", "=>", "→", "⇒", "—>", "–>")
 
@@ -205,6 +215,7 @@ def _ascii_to_mermaid(s: str, limit: int = 8) -> str:
     lines.append(f"{aa} -- {lbl} --> {bb}" if lbl else f"{aa} --> {bb}")
   return _sanitize_mermaid("\n".join(lines))
 
+# ---------- Mermaid repair / normalization ----------
 _MER_BLOCK = re.compile(r"```(?:mermaid)?\s*([\s\S]*?)```", re.I)
 
 def _strip_fences(s:str)->str:
@@ -232,7 +243,6 @@ def _coerce_flowchart_lr(s: str) -> str:
 
 def _normalize_arrows(s: str) -> str:
   return (s or "").replace("–>", "->").replace("—>", "->").replace("⇒", "->").replace("→", "->")
-
 def _strip_inline_headers(s: str) -> str:
   def _clean_line(i, line):
     if i == 0:
@@ -240,6 +250,7 @@ def _strip_inline_headers(s: str) -> str:
     line = re.sub(r"(?i)\bgraph\s+(LR|RL|TB|BT)\b", "", line)
     line = re.sub(r"(?i)\bflowchart\s+(LR|RL|TB|BT)\b", "", line)
     return re.sub(r"\s{2,}", " ", line).strip()
+
   lines = (s or "").splitlines()
   return "\n".join(_clean_line(i, ln) for i, ln in enumerate(lines))
 
@@ -312,7 +323,9 @@ def _repair_mermaid(src: str) -> str:
   s = _normalize_arrows(s)
   s = _strip_inline_headers(s)
   s = _sanitize_mermaid(s)
+
   has_subgraph = bool(re.search(r"(?i)^\s*subgraph\b", s, re.M))
+
   good = []
   for line in s.splitlines():
     t = line.strip()
@@ -324,13 +337,18 @@ def _repair_mermaid(src: str) -> str:
       continue
     if t.count("[") == t.count("]") and t.count("(") == t.count(")"):
       good.append(t)
+
   s2 = "\n".join(good).strip()
+
   if not has_subgraph:
     s2 = _ensure_node_defs(s2)
+
   if "-.->" in s2 and "classDef dashed" not in s2:
     s2 += "\nclassDef dashed stroke-dasharray: 4 3,stroke:#888,color:#555;"
+
   if _is_plausible_mermaid(s2):
     return s2
+
   ascii_try = _ascii_to_mermaid(src)
   if _is_plausible_mermaid(ascii_try):
     if not has_subgraph:
@@ -338,6 +356,7 @@ def _repair_mermaid(src: str) -> str:
     if "-.->" in ascii_try and "classDef dashed" not in ascii_try:
       ascii_try += "\nclassDef dashed stroke-dasharray: 4 3,stroke:#888,color:#555;"
     return ascii_try
+
   synth = _skeleton_from_text(src or "")
   return synth if _is_plausible_mermaid(synth) else ""
 
@@ -402,6 +421,7 @@ def _inject_brand_css(svg_text: str, brand: dict | None) -> str:
   stroke  = brand.get("stroke",  "#0f172a")
   font    = brand.get("font",    "ui-sans-serif, system-ui, -apple-system")
   rounded = brand.get("rounded", True)
+
   style = f"""
   <style>
     .mermaid text {{ font-family: {font}; fill: {stroke}; }}
@@ -415,6 +435,7 @@ def _inject_brand_css(svg_text: str, brand: dict | None) -> str:
     .mermaid .edgePath path[stroke-dasharray] {{ stroke: {stroke}; }}
   </style>
   """.strip()
+
   return re.sub(r"(<svg[^>]*>)", r"\1" + style, svg_text, count=1, flags=re.I)
 
 @router.post("/ask")
@@ -434,6 +455,7 @@ async def diagram_plan(payload:dict=Body(...)):
   q = (payload or {}).get("q") or ""
   if _risky(q): return JSONResponse({"ok":False,"error":"Blocked for safety."}, status_code=400)
   ql = q.lower()
+
   if USE_GROUNDED_DEFAULT:
     hits = await _open_access_hits(q, per=8)
     if hits:
@@ -455,34 +477,43 @@ async def diagram_plan(payload:dict=Body(...)):
           mer = _default_mermaid()
         srcs = hits
         return JSONResponse({"ok": True, "make_diagram": True, "mermaid": mer, "summary": summ, "sources": srcs})
+
   if "cia triad" in ql or ("confidentiality" in ql and "integrity" in ql and "availability" in ql):
     mer = _diagram_cia()
     srcs = await _scholar_search("CIA triad confidentiality integrity availability security controls", per=5)
     return JSONResponse({"ok":True,"make_diagram":True,"mermaid":mer,"summary":"CIA triad with concrete controls.","sources":srcs})
+
   if "zero trust" in ql or "zerotrust" in ql:
     mer = _diagram_zerotrust()
     srcs = await _scholar_search("zero trust architecture policy identity device context continuous verification", per=5)
     return JSONResponse({"ok":True,"make_diagram":True,"mermaid":mer,"summary":"Zero Trust decision path.","sources":srcs})
+
   dlp_preseed = _diagram_dlp() if ("data loss prevention" in ql or "dlp" in ql) else ""
+
   try:
     req_labels = []
     m = re.search(r"required\s+labels\s*:\s*(.+)$", q, re.I)
     if m:
       req_labels = [t.strip() for t in re.split(r"[,/;]| and ", m.group(1)) if t.strip()]
+
     llm_mer, llm_sum = _llm_mermaid_plan(q, req_labels)
     mer = llm_mer if _is_plausible_mermaid(llm_mer) else ""
+
     if not mer and dlp_preseed:
       mer = dlp_preseed
     if not mer:
       mer = _skeleton_from_text(q)
+
     make = bool(_is_plausible_mermaid(mer))
     if not make:
       mer = _default_mermaid()
       make = True
+
     q_norms = _normalize_for_oa(q)
     srcs = await _scholar_search((q_norms[0] if q_norms else q), per=5)
     summary = llm_sum or ("Data Loss Prevention pipeline with policy enforcement and mitigations." if dlp_preseed else "")
     return JSONResponse({"ok":True,"make_diagram":make, "mermaid": mer, "summary": summary, "sources": srcs})
+
   except Exception as e:
     return JSONResponse({"ok":False,"error":f"llm: {e}"}, status_code=500)
 
@@ -500,6 +531,196 @@ def diagram_ask(payload:dict=Body(...)):
   except Exception as e:
     return JSONResponse({"ok":False,"error":f"llm: {e}"}, status_code=500)
 
+# ---------- AutoChart (LLM → normalized chart spec) ----------
+_AUTOCHART_SCHEMA = (
+  "Return JSON exactly as: {"
+  "  chart_type: 'bar'|'pie'|'line'|'heatmap'|'network'|'geo',"
+  "  title: string,"
+  "  data: array|object, "
+  "  enc: {x?:str,y?:str,color?:str,size?:str,group?:str,time?:str,lat?:str,lon?:str,source?:str,target?:str},"
+  "  animation?: {field?:string, duration_ms?:number, mode?:'reveal'|'tween'|'force'|'burst'|'loop'},"
+  "  notes?: string,"
+  "  warnings?: string[]"
+  "}. "
+  "Rules: "
+  "- Choose the chart_type that best fits the prompt semantics. "
+  "- If tabular facts are implied (e.g., categories + values), return a 'data' array of objects with columns used by enc. "
+  "- For 'network', return data = {nodes:[{id,label,group?}], edges:[{source,target,weight?}]}. "
+  "- For 'geo', return an array with lat/lon and optional value/time fields. Use enc.lat/enc.lon for names. "
+  "- Prefer a small dataset (≤ 20 rows, ≤ 15 nodes). "
+  "- If the prompt contains time words (year, month, day), include a time field and animation.field. "
+  "- No code fences."
+)
+
+def _autochart_llm_plan(q: str) -> dict:
+  seed_shots = [
+    ("Compare 2023 browser share", {
+      "chart_type":"pie","title":"Browser Share 2023",
+      "enc":{"group":"browser","size":"share"},
+      "data":[{"browser":"Chrome","share":63},{"browser":"Safari","share":20},{"browser":"Edge","share":6},{"browser":"Firefox","share":5},{"browser":"Other","share":6}],
+      "animation":{"field":"","duration_ms":700}
+    }),
+    ("Monthly signups by plan with total", {
+      "chart_type":"line","title":"Monthly Signups",
+      "enc":{"x":"month","y":"signups","color":"plan","time":"month"},
+      "data":[
+        {"month":"Jan","plan":"Free","signups":120},
+        {"month":"Jan","plan":"Pro","signups":40},
+        {"month":"Feb","plan":"Free","signups":150},
+        {"month":"Feb","plan":"Pro","signups":60}
+      ],
+      "animation":{"field":"month","duration_ms":800}
+    }),
+    ("Phishing kill-chain relationships", {
+      "chart_type":"network","title":"Phishing Kill-Chain",
+      "enc":{"source":"source","target":"target","group":"group"},
+      "data":{"nodes":[
+                {"id":"Email","label":"Email"},
+                {"id":"Link","label":"Malicious Link"},
+                {"id":"Page","label":"Fake Login"},
+                {"id":"Creds","label":"Stolen Creds"}],
+              "edges":[
+                {"source":"Email","target":"Link"},
+                {"source":"Link","target":"Page"},
+                {"source":"Page","target":"Creds"}]},
+      "animation":{"duration_ms":900}
+    }),
+  ]
+  prompt = _AUTOCHART_SCHEMA + "\n\nExamples:\n" + "\n".join(
+    [f"Q: {a}\nA: {json.dumps(b)}" for a,b in seed_shots]
+  )
+  spec = gen_json(prompt, q, model=MODEL, temperature=0.2) or {}
+  return spec
+
+def _autochart_sanity(spec: dict) -> dict:
+  ct = (spec.get("chart_type") or "").lower()
+  if ct not in {"bar","pie","line","heatmap","network","geo"}:
+    spec["chart_type"] = "bar"
+  spec.setdefault("title","AutoChart")
+  spec.setdefault("enc",{})
+  spec.setdefault("animation",{"duration_ms":800})
+  if isinstance(spec.get("data"), list) and len(spec["data"])>200:
+    spec["data"] = spec["data"][:200]
+  if ct=="network" and isinstance(spec.get("data"), dict):
+    nodes = (spec["data"].get("nodes") or [])[:80]
+    edges = (spec["data"].get("edges") or [])[:160]
+    spec["data"] = {"nodes":nodes,"edges":edges}
+  return spec
+# ----- Rule-based fallback if LLM fails -----
+def _autochart_guess_kind(q: str) -> str:
+    t = (q or "").lower()
+    if any(k in t for k in ["map", "geo", "lat", "lon", "latitude", "longitude", "city", "country"]):
+        return "geo"
+    if any(k in t for k in ["network", "graph", "nodes", "edges", "relationships", "kill-chain", "kill chain"]):
+        return "network"
+    if any(k in t for k in ["confusion matrix", "heatmap", "correlation", "matrix"]):
+        return "heatmap"
+    if any(k in t for k in ["share", "composition", "parts of", "breakdown", "percent", "percentage", "proportion"]):
+        return "pie"
+    if any(k in t for k in ["trend", "over time", "monthly", "weekly", "daily", "per year", "timeline"]):
+        return "line"
+    return "bar"
+
+def _autochart_rule_spec(q: str) -> dict:
+    kind = _autochart_guess_kind(q)
+    if kind == "geo":
+        return {"chart_type":"geo","title":"Locations (rule)","enc":{"lat":"lat","lon":"lon","time":"t","size":"count"},
+                "data":[{"city":"NYC","lat":40.7128,"lon":-74.0060,"t":"Mon","count":3},
+                        {"city":"NYC","lat":40.7128,"lon":-74.0060,"t":"Tue","count":5},
+                        {"city":"LA","lat":34.0522,"lon":-118.2437,"t":"Mon","count":2},
+                        {"city":"LA","lat":34.0522,"lon":-118.2437,"t":"Tue","count":6}],
+                "animation":{"field":"t","duration_ms":900},
+                "notes":"Rule-based fallback (no LLM)."}
+    if kind == "network":
+        return {"chart_type":"network","title":"Relationship Graph (rule)","enc":{"source":"source","target":"target"},
+                "data":{"nodes":[{"id":"A"},{"id":"B"},{"id":"C"},{"id":"D"}],
+                        "edges":[{"source":"A","target":"B"},{"source":"A","target":"C"},{"source":"C","target":"D"}]},
+                "notes":"Rule-based fallback (no LLM)."}
+    if kind == "heatmap":
+        return {"chart_type":"heatmap","title":"Heatmap (rule)","enc":{"x":"pred","y":"true","color":"count"},
+                "data":[{"true":"Cat","pred":"Cat","count":40},{"true":"Cat","pred":"Dog","count":10},
+                        {"true":"Dog","pred":"Cat","count":7},{"true":"Dog","pred":"Dog","count":43}],
+                "notes":"Rule-based fallback (no LLM)."}
+    if kind == "pie":
+        return {"chart_type":"pie","title":"Composition (rule)","enc":{"group":"group","size":"value"},
+                "data":[{"group":"A","value":50},{"group":"B","value":30},{"group":"C","value":20}],
+                "notes":"Rule-based fallback (no LLM)."}
+    if kind == "line":
+        return {"chart_type":"line","title":"Trend (rule)","enc":{"x":"month","y":"value","time":"month"},
+                "data":[{"month":"Jan","value":10},{"month":"Feb","value":14},{"month":"Mar","value":12},{"month":"Apr","value":18}],
+                "animation":{"field":"month","duration_ms":800},
+                "notes":"Rule-based fallback (no LLM)."}
+    return {"chart_type":"bar","title":"Bars (rule)","enc":{"x":"label","y":"value"},
+            "data":[{"label":"X","value":7},{"label":"Y","value":5},{"label":"Z","value":9}],
+            "notes":"Rule-based fallback (no LLM)."}
+
+
+@router.post("/autochart/plan")
+def autochart_plan(payload:dict=Body(...)):
+  q = (payload or {}).get("q") or ""
+  if _risky(q):
+    return JSONResponse({"ok":False,"error":"Blocked for safety."}, status_code=400)
+  try:
+    spec = _autochart_llm_plan(q)
+    spec = _autochart_sanity(spec)
+    return JSONResponse({"ok":True,"spec":spec})
+  except Exception as e:
+    fb = {
+      "chart_type":"bar","title":"Fallback Bar",
+      "enc":{"x":"category","y":"value"},
+      "data":[{"category":"A","value":5},{"category":"B","value":3},{"category":"C","value":7}],
+      "animation":{"duration_ms":700},
+      "notes":"LLM error; fallback synthetic chart."
+    }
+    return JSONResponse({"ok":True,"spec":fb,"fallback":"llm_error","error":str(e)})
+
+
+@router.post("/autochart/sample")
+def autochart_sample(payload:dict=Body(...)):
+  kind = ((payload or {}).get("kind") or "bar").lower()
+  if kind == "geo":
+      spec = {
+          "chart_type": "geo",
+          "title": "Incidents by City (Animated by Day)",
+          "enc": {"lat": "lat", "lon": "lon", "time": "day", "size": "count"},
+          "data": [
+              # Monday
+              {"city": "NYC", "lat": 40.7128, "lon": -74.0060, "day": "Mon", "count": 4},
+              {"city": "LA", "lat": 34.0522, "lon": -118.2437, "day": "Mon", "count": 2},
+              {"city": "SF", "lat": 37.7749, "lon": -122.4194, "day": "Mon", "count": 1},
+              # Tuesday
+              {"city": "NYC", "lat": 40.7128, "lon": -74.0060, "day": "Tue", "count": 6},
+              {"city": "LA", "lat": 34.0522, "lon": -118.2437, "day": "Tue", "count": 5},
+              {"city": "SF", "lat": 37.7749, "lon": -122.4194, "day": "Tue", "count": 2},
+              # Wednesday
+              {"city": "NYC", "lat": 40.7128, "lon": -74.0060, "day": "Wed", "count": 7},
+              {"city": "LA", "lat": 34.0522, "lon": -118.2437, "day": "Wed", "count": 4},
+              {"city": "SF", "lat": 37.7749, "lon": -122.4194, "day": "Wed", "count": 3}
+          ],
+          "animation": {"field": "day", "duration_ms": 900, "mode": "reveal"}
+      }
+  elif kind == "network":
+    spec={"chart_type":"network","title":"Mini Net","enc":{"source":"source","target":"target"},
+         "data":{"nodes":[{"id":"A"},{"id":"B"},{"id":"C"}],
+                 "edges":[{"source":"A","target":"B"},{"source":"B","target":"C"}]}}
+  elif kind == "heatmap":
+    spec={"chart_type":"heatmap","title":"Confusion Matrix","enc":{"x":"pred","y":"true","color":"count"},
+         "data":[{"true":"Cat","pred":"Cat","count":42},{"true":"Cat","pred":"Dog","count":8},
+                 {"true":"Dog","pred":"Cat","count":5},{"true":"Dog","pred":"Dog","count":45}]}
+  else:
+      spec = {"chart_type": "bar", "title": "Bars",
+              "enc": {"x": "label", "y": "value", "time": "month"},
+              "data": [{"label": "X", "value": 5, "month": "Jan"},
+                       {"label": "Y", "value": 8, "month": "Feb"},
+                       {"label": "Z", "value": 3, "month": "Mar"}],
+              "animation": {"field": "month", "duration_ms": 900, "mode": "reveal"}}
+
+  return JSONResponse({"ok":True,"spec":_autochart_sanity(spec)})
+
+# Put near other helpers in studio_routes.py
+
+
+# ---------- notebook & docs ----------
 @router.get("/notebook/templates")
 def notebook_templates():
   tpls = [
@@ -599,15 +820,19 @@ def export_image(payload: dict = Body(...)):
   scale = float((payload or {}).get("scale") or 1.0)
   brand = (payload or {}).get("brand") or None
   fname = (payload or {}).get("filename") or "diagram"
+
   if not svg_text.strip():
     return JSONResponse({"ok": False, "error": "No SVG provided"}, status_code=400)
+
   svg_text = _inject_brand_css(svg_text, brand)
+
   if fmt == "svg":
     return Response(
       content=svg_text.encode("utf-8"),
       media_type="image/svg+xml",
       headers={"Content-Disposition": f'attachment; filename="{fname}.svg"'}
     )
+
   elif fmt == "png":
     try:
       import cairosvg
@@ -619,6 +844,7 @@ def export_image(payload: dict = Body(...)):
       )
     except Exception as e:
       return JSONResponse({"ok": False, "error": f"PNG convert: {e}"}, status_code=500)
+
   else:
     return JSONResponse({"ok": False, "error": f"Unknown format: {fmt}"}, status_code=400)
 
@@ -628,6 +854,9 @@ def scholarviz(request: Request, q: str = Query("", description="Ask the model")
 <!doctype html><html><head>
 <meta charset="utf-8"/><title>ScholarViz</title>
 <script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1/dist/leaflet.css"/>
+<script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>
+<script src="https://unpkg.com/leaflet@1/dist/leaflet.js"></script>
 <style>
 body{font-family:ui-sans-serif,system-ui,-apple-system;margin:0} header{background:#0f172a;color:#fff;padding:12px 16px}
 main{max-width:960px;margin:0 auto;padding:16px} .card{border:1px solid #e5e7eb;border-radius:12px;padding:14px;margin:12px 0}
@@ -683,6 +912,27 @@ button{background:#111827;color:#fff;border:none;border-radius:8px;padding:8px 1
   </div>
 
   <div id="fig_thumbs" style="margin-top:10px"></div>
+</div>
+
+<div class="card">
+  <h3 style="margin:0 0 8px">AutoChart (model picks chart + animates)</h3>
+  <div style="display:flex;gap:8px;flex-wrap:wrap">
+    <input id="ac_q" placeholder="e.g., Show 2024 monthly malware detections by family" style="flex:1;min-width:280px"/>
+  <button id="ac_plan">Plan</button>
+  <select id="ac_kind">
+    <option value="bar">bar</option>
+    <option value="line">line</option>
+    <option value="pie">pie</option>
+    <option value="heatmap">heatmap</option>
+    <option value="network">network</option>
+    <option value="geo" selected>geo</option>
+  </select>
+  <button id="ac_sample">Sample</button>
+</div>
+  <pre id="ac_meta" style="white-space:pre-wrap;margin-top:8px;color:#6b7280"></pre>
+  <div id="ac_plot" style="width:100%;min-height:360px;border:1px solid #e5e7eb;border-radius:12px;margin-top:8px;display:none"></div>
+  <div id="ac_map"  style="width:100%;height:420px;border:1px solid #e5e7eb;border-radius:12px;margin-top:8px;display:none"></div>
+  <div id="ac_net"  style="width:100%;height:420px;border:1px solid #e5e7eb;border-radius:12px;margin-top:8px;display:none"></div>
 </div>
 
 <div class="card">
@@ -876,9 +1126,7 @@ document.getElementById('plan_grounded').onclick = async ()=>{
     }
 
     out.textContent = (d.summary||'');
-    if (d.fallback && (!d.mermaid || !d.mermaid.trim())) {
-      out.textContent = '(Fallback: '+d.fallback+')\\n' + out.textContent;
-    }
+    if (d.fallback) out.textContent = '(Fallback: '+d.fallback+')\\n' + out.textContent;
 
     if (d.mermaid){
       CURRENT_MERMAID = d.mermaid;
@@ -989,6 +1237,302 @@ document.getElementById('doc_sum').onclick = async ()=>{
     out.textContent = d.ok? JSON.stringify(d.artifacts||{}, null, 2) : ('Error: '+d.error);
   };
 })();
+
+// ---------- AutoChart client ----------
+let AC_SPEC = null;
+let AC_MAP = null;
+let AC_NET = null;
+
+function acHideAll(){
+  document.getElementById('ac_plot').style.display='none';
+  document.getElementById('ac_map').style.display='none';
+  document.getElementById('ac_net').style.display='none';
+}
+
+function acMeta(spec){
+  const w = (spec.warnings||[]).join('; ');
+  return (spec.title? ('Title: '+spec.title+'\\n'):'') +
+         ('Type: '+spec.chart_type+'\\n') +
+         (spec.notes? ('Notes: '+spec.notes+'\\n'):'') +
+         (w? ('Warnings: '+w+'\\n'):'');
+}
+
+function acUnique(vals){ return [...new Set(vals)]; }
+function acGroupBy(arr, key){ const m={}; arr.forEach(r=>{const k=r[key]; (m[k]||(m[k]=[])).push(r);}); return m; }
+
+function acToPlotly(spec){
+  const enc = spec.enc||{};
+  const data = spec.data||[];
+  const tfield = (spec.animation && spec.animation.field) || enc.time || "";
+  const duration = (spec.animation && spec.animation.duration_ms) || 800;
+  const mode = (spec.animation && spec.animation.mode) || "reveal";
+
+  // No time? simple static plots
+  if (!tfield){
+    if (spec.chart_type==='bar'){
+      const x= data.map(r=>r[enc.x]); const y= data.map(r=>r[enc.y]);
+      return {traces:[{type:'bar', x, y}], layout:{title:spec.title}, frames:[], duration};
+    }
+    if (spec.chart_type==='line'){
+      const groups = enc.color? acUnique(data.map(r=>r[enc.color])): [null];
+      const traces = groups.map(g=>{
+        const rows = data.filter(r=> (g===null? true : r[enc.color]===g));
+        return {type:'scatter', mode:'lines+markers', name:g||undefined,
+                x: rows.map(r=>r[enc.x]), y: rows.map(r=>r[enc.y])};
+      });
+      return {traces, layout:{title:spec.title}, frames:[], duration};
+    }
+    if (spec.chart_type==='pie'){
+      const labels = data.map(r=> r[enc.group] || r[enc.x]);
+      const values = data.map(r=> r[enc.size]  || r[enc.y]);
+      return {traces:[{type:'pie', labels, values, textinfo:'label+percent'}],
+              layout:{title:spec.title}, frames:[], duration};
+    }
+    if (spec.chart_type==='heatmap'){
+      const xs=acUnique(data.map(r=>r[enc.x])), ys=acUnique(data.map(r=>r[enc.y]));
+      const Z = ys.map(_=> xs.map(__=>0));
+      data.forEach(r=>{const xi=xs.indexOf(r[enc.x]); const yi=ys.indexOf(r[enc.y]); Z[yi][xi] = r[enc.color] ?? r.value ?? 0;});
+      return {traces:[{type:'heatmap', x:xs, y:ys, z:Z}],
+              layout:{title:spec.title}, frames:[], duration};
+    }
+    return {traces:[], layout:{title:spec.title}, frames:[], duration};
+  }
+
+  // Time-aware: build frames
+  const times = acUnique(data.map(r=> r[tfield]));
+  const byTime = acGroupBy(data, tfield);
+  let traces=[], frames=[];
+
+  if (spec.chart_type==='bar'){
+    const cats = acUnique(data.map(r=> r[enc.x]));
+    traces = [{type:'bar', x: cats, y: cats.map(_=>0)}];
+    frames = times.map(t=>{
+      const rows = byTime[t]||[];
+      const y = cats.map(c=> (rows.find(r=>r[enc.x]===c)||{})[enc.y] || 0);
+      return {name:String(t), data:[{x:cats, y}]};
+    });
+  }
+  else if (spec.chart_type==='line'){
+    const groups = enc.color? acUnique(data.map(r=>r[enc.color])): [null];
+    traces = groups.map(g=> ({type:'scatter', mode:'lines+markers', name:g||undefined, x:[], y:[]}));
+    frames = times.map(t=>{
+      const rows = byTime[t]||[];
+      const payload = groups.map(g=>{
+        const slice = rows.filter(r=> (g===null? true : r[enc.color]===g));
+        return {x: slice.map(r=> r[enc.x]), y: slice.map(r=> r[enc.y])};
+      });
+      return {name:String(t), data: payload};
+    });
+  }
+  else if (spec.chart_type==='pie'){
+    const cats = acUnique(data.map(r=> r[enc.group] || r[enc.x]));
+    traces = [{type:'pie', labels: cats, values: cats.map(_=>0), textinfo:'label+percent'}];
+    frames = times.map(t=>{
+      const rows = byTime[t]||[];
+      const vals = cats.map(c=>{
+        const row = rows.find(r=> (r[enc.group]||r[enc.x])===c);
+        return (row && (row[enc.size]||row[enc.y])) || 0;
+      });
+      return {name:String(t), data:[{labels:cats, values:vals}]};
+    });
+  }
+  else if (spec.chart_type==='heatmap'){
+    const xs=acUnique(data.map(r=>r[enc.x])), ys=acUnique(data.map(r=>r[enc.y]));
+    traces = [{type:'heatmap', x:xs, y:ys, z: ys.map(_=> xs.map(__=>0))}];
+    frames = times.map(t=>{
+      const rows = byTime[t]||[];
+      const Z = ys.map(_=> xs.map(__=>0));
+      rows.forEach(r=>{
+        const xi=xs.indexOf(r[enc.x]); const yi=ys.indexOf(r[enc.y]);
+        Z[yi][xi] = r[enc.color] ?? r.value ?? 0;
+      });
+      return {name:String(t), data:[{x:xs, y:ys, z:Z}]};
+    });
+  }
+
+  const layout = {
+    title: spec.title,
+    updatemenus: [{
+      type:'buttons', x:0.02, y:1.15, xanchor:'left',
+      buttons: [
+        {label:'Play', method:'animate',
+         args: [null, {fromcurrent:true, transition:{duration:duration*0.4},
+                       frame:{duration:duration, redraw:true}, mode:'immediate'}]},
+        {label:'Pause', method:'animate',
+         args: [[null], {mode:'immediate', frame:{duration:0, redraw:false}, transition:{duration:0}}]}
+      ]
+    }],
+    sliders: [{
+      active:0, x:0.12, len:0.8, y:1.12,
+      currentvalue:{prefix: (tfield||'time')+': '},
+      steps: times.map(t=>({label:String(t), method:'animate',
+        args:[[String(t)], {mode:'immediate', frame:{duration:duration, redraw:true},
+                            transition:{duration:duration*0.4}}]}))
+    }]
+  };
+
+  return {traces, layout, frames, duration};
+}
+
+function acAnimatePlotly(elId, pack){
+  const el = document.getElementById(elId);
+  el.style.display='block';
+  Plotly.newPlot(el, pack.traces, pack.layout, {displayModeBar:true, responsive:true}).then(()=>{
+    if (pack.frames && pack.frames.length){
+      Plotly.addFrames(el, pack.frames);
+    }
+  });
+}
+
+
+function acRenderNetwork(spec){
+  acHideAll();
+  const div = document.getElementById('ac_net');
+  div.style.display='block';
+  if (window.AC_NET && typeof window.AC_NET.destroy==='function'){ try{window.AC_NET.destroy();}catch(_){} }
+
+  const nodes = (spec.data.nodes||[]).map(n=> ({ data:{ id:n.id, label:n.label||n.id, group:n.group||'' }}));
+  const edges = (spec.data.edges||[]).map(e=> ({ data:{ source:e.source, target:e.target, weight:e.weight||1 }}));
+
+  window.AC_NET = cytoscape({
+    container: div,
+    elements: [...nodes, ...edges],
+    style: [
+      { selector: 'node',
+        style: {
+          'label':'data(label)','text-valign':'center',
+          'background-color':'#60a5fa','border-width':1,'border-color':'#0f172a',
+          'width':28,'height':28,'font-size':10
+        }},
+      { selector: 'edge',
+        style: {'width':2,'line-color':'#94a3b8','curve-style':'bezier',
+                'target-arrow-shape':'triangle','target-arrow-color':'#94a3b8'} },
+      { selector: 'node.pulse', style: { 'width':36, 'height':36 } }
+    ],
+    layout: { name:'cose', animate:true, animationDuration:500 }
+  });
+
+  // gentle continuous motion + pulsing
+  let tick = 0;
+  const jiggle = setInterval(()=>{
+    if (!window.AC_NET) return clearInterval(jiggle);
+    tick++;
+    window.AC_NET.layout({name:'cose', animate:true, animationDuration:500}).run();
+    window.AC_NET.nodes().removeClass('pulse');
+    window.AC_NET.nodes().filter((n,i)=> (i + tick) % 7 === 0).addClass('pulse');
+  }, 1800);
+
+  window.AC_NET.on('mouseover','node', e=>{
+    const n = e.target;
+    n.connectedEdges().animate({style:{'line-color':'#1f2937','target-arrow-color':'#1f2937'}},{duration:200});
+  });
+  window.AC_NET.on('mouseout','node', e=>{
+    const n = e.target;
+    n.connectedEdges().animate({style:{'line-color':'#94a3b8','target-arrow-color':'#94a3b8'}},{duration:200});
+  });
+}
+
+
+function acRenderGeo(spec){
+  acHideAll();
+  const div = document.getElementById('ac_map');
+  div.style.display='block';
+  const data = spec.data||[];
+  const enc = spec.enc||{};
+  const latK = enc.lat||'lat', lonK=enc.lon||'lon';
+  const timeField = (spec.animation && spec.animation.field) || enc.time || null;
+  const dur = (spec.animation && spec.animation.duration_ms) || 900;
+
+  if (!window.AC_MAP){
+    window.AC_MAP = L.map('ac_map').setView([20,0], 2);
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {maxZoom: 19}).addTo(window.AC_MAP);
+  }
+  window.AC_MAP.eachLayer(l=>{ if (l instanceof L.CircleMarker) window.AC_MAP.removeLayer(l); });
+
+  function drawPoints(rows){
+    const key = (r)=> `${+r[latK].toFixed(4)},${+r[lonK].toFixed(4)}`;
+    const buckets = {};
+    rows.forEach(r=>{
+      const la=r[latK], lo=r[lonK];
+      if (la==null || lo==null) return;
+      const k = key(r);
+      (buckets[k]||(buckets[k]=[])).push(r);
+    });
+    Object.entries(buckets).forEach(([k, arr])=>{
+      const [la, lo] = k.split(',').map(Number);
+      const total = arr.reduce((s,r)=> s + (+r[enc.size] || +r[enc.color] || +r.value || 1), 0);
+      const rad = Math.max(5, Math.min(16, 4 + Math.sqrt(total)));
+      const label = (arr[0].city||'point') + (arr.length>1? ` (+${arr.length-1})`:'') + (total?`: ${total}`:'');
+      L.circleMarker([la, lo], {radius: rad}).addTo(window.AC_MAP).bindPopup(label);
+    });
+  }
+
+  if (!timeField){
+    drawPoints(data);
+    return;
+  }
+
+  const times = [...new Set(data.map(r=> r[timeField]))];
+  let i=0;
+  function drawFrame(k){
+    window.AC_MAP.eachLayer(l=>{ if (l instanceof L.CircleMarker) window.AC_MAP.removeLayer(l); });
+    const slice = data.filter(r=> r[timeField]===times[k]);
+    drawPoints(slice);
+  }
+  drawFrame(0);
+
+  if (times.length>1){
+    if (window._geoTimer) clearInterval(window._geoTimer);
+    window._geoTimer = setInterval(()=>{
+      i = (i+1) % times.length;
+      drawFrame(i);
+    }, Math.max(350, dur));
+  }
+}
+
+
+async function acRender(spec){
+  AC_SPEC = spec;
+  document.getElementById('ac_meta').textContent = acMeta(spec);
+
+  if (['bar','line','pie','heatmap'].includes(spec.chart_type)){
+    acHideAll();
+    const pack = acToPlotly(spec);
+    acAnimatePlotly('ac_plot', pack);
+    return;
+  }
+  if (spec.chart_type === 'network'){
+    acRenderNetwork(spec);
+    return;
+  }
+  if (spec.chart_type === 'geo'){
+    acRenderGeo(spec);
+    return;
+  }
+}
+
+async function acPlan(){
+  const q = document.getElementById('ac_q').value.trim();
+  document.getElementById('ac_meta').textContent='…';
+  const d = await fetch('/autochart/plan', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({q})}).then(r=>r.json());
+  if (!d.ok){ document.getElementById('ac_meta').textContent = 'Error: '+(d.error||''); return; }
+  acRender(d.spec);
+}
+
+async function acSample(){
+  document.getElementById('ac_meta').textContent='…';
+  const kind = document.getElementById('ac_kind').value || 'bar';
+  const d = await fetch('/autochart/sample', {
+    method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({kind})
+  }).then(r=>r.json());
+  if (!d.ok){ document.getElementById('ac_meta').textContent = 'Error: '+(d.error||''); return; }
+  acRender(d.spec);
+}
+
+document.getElementById('ac_plan').onclick = acPlan;
+document.getElementById('ac_sample').onclick = acSample;
 </script>
 
 <script src="https://unpkg.com/cytoscape@3/dist/cytoscape.min.js"></script>
@@ -1072,8 +1616,10 @@ async def _open_access_hits(q: str, per: int = 8, seed:int=0, diversify:bool=Fal
   url = "https://api.openalex.org/works"
   now = datetime.date.today()
   start = f"{now.year-4}-01-01"
+
   must = _tok("data loss prevention saas")
   nice = _tok("policy engine classifier quarantine allow cloud security zero trust access control dlp")
+
   base = _normalize_for_oa(q) or [q]
   extra = [
     "data loss prevention SaaS",
@@ -1085,6 +1631,7 @@ async def _open_access_hits(q: str, per: int = 8, seed:int=0, diversify:bool=Fal
   [queries.append(x) for x in (base[:2] + extra) if x not in queries]
   queries = _uniq(queries)
   queries = _shuffle_with_seed(queries, seed, diversify)
+
   async def _hit_once(hx, search: str, relax: bool) -> List[dict]:
     params = {
       "search": search,
@@ -1094,6 +1641,7 @@ async def _open_access_hits(q: str, per: int = 8, seed:int=0, diversify:bool=Fal
     }
     r = await hx.get(url, params=params); r.raise_for_status()
     return r.json().get("results", []) or []
+
   results = []
   try:
     async with httpx.AsyncClient(timeout=16.0) as hx:
@@ -1107,6 +1655,7 @@ async def _open_access_hits(q: str, per: int = 8, seed:int=0, diversify:bool=Fal
         if results: break
   except Exception:
     results = []
+
   ranked = []
   for w in results:
     loc = (w.get("primary_location") or {})
@@ -1114,8 +1663,10 @@ async def _open_access_hits(q: str, per: int = 8, seed:int=0, diversify:bool=Fal
     pdf_url = loc.get("pdf_url") or oa.get("oa_url") or ""
     if not pdf_url: continue
     ranked.append((_relevance_score(w, must, nice), w, pdf_url))
+
   ranked.sort(key=lambda t: -t[0])
   ranked = [t for t in ranked if t[0] >= 10] or ranked
+
   out = []
   for sc, w, pdf_url in ranked[:per]:
     loc = (w.get("primary_location") or {})
@@ -1142,6 +1693,7 @@ def _fig_captions(raw: str) -> List[str]:
 def _rank_snippets(q: str, snippets: List[str], k: int = 10, seed:int=0, diversify:bool=False) -> List[dict]:
   def _jitter(x, r, do):
     return x + (r.uniform(-1e-3, 1e-3) if do else 0.0)
+
   r = _rng(seed)
   try:
     from sklearn.feature_extraction.text import TfidfVectorizer
@@ -1241,8 +1793,11 @@ async def diagram_grounded(payload:dict=Body(...)):
   seed = int((payload or {}).get("seed") or 0)
   diversify = bool((payload or {}).get("diversify") or False)
   temp = float((payload or {}).get("temp") or 0.2)
+
   if _risky(q): return JSONResponse({"ok":False,"error":"Blocked for safety."}, status_code=400)
+
   hits = await _open_access_hits(q, per=8, seed=seed, diversify=diversify)
+
   if not hits:
     mer, summ = _llm_mermaid_plan(q)
     if not mer:
@@ -1252,16 +1807,17 @@ async def diagram_grounded(payload:dict=Body(...)):
     return JSONResponse({
       "ok": True,
       "mermaid": mer,
-      "summary": (summ or "Synthesized without OA PDFs."),
+      "summary": "(Fallback: no_oa_pdfs) " + (summ or "Synthesized without OA PDFs."),
       "cites": [],
       "snippets": [],
-      "sources": [],
-      "fallback": "no_oa_pdfs"
+      "sources": []
     })
+
   texts = []
   for h in hits[:3]:
     t = await _fetch_pdf_text(h["pdf"])
     if t: texts.append((h, t))
+
   if not texts:
     mer, summ = _llm_mermaid_plan(q)
     if not mer:
@@ -1271,12 +1827,12 @@ async def diagram_grounded(payload:dict=Body(...)):
     return JSONResponse({
       "ok": True,
       "mermaid": mer,
-      "summary": (summ or "Synthesized without extracted PDF text."),
+      "summary": "(Fallback: no_oa_text) " + (summ or "Synthesized without extracted PDF text."),
       "cites": [],
       "snippets": [],
-      "sources": hits,
-      "fallback": "no_oa_text"
+      "sources": hits
     })
+
   figs_all: List[dict] = []
   for h, _ in texts:
     try:
@@ -1288,23 +1844,27 @@ async def diagram_grounded(payload:dict=Body(...)):
         figs_all.append({"paper": h["title"], **f})
         if len(figs_all) >= 6: break
     if len(figs_all) >= 6: break
+
   pool = []
   for h, t in texts:
     caps = _fig_captions(t)
     blks = _split_blocks(t)
     pool.extend([f"[cap] {c}" for c in caps] + blks)
+
   if figs_all:
     for fi in figs_all:
       if fi.get("caption"):
         pool.insert(0, f"[figcap p{fi['page']}] {fi['caption']}")
       if fi.get("ocr"):
         pool.insert(0, f"[figocr p{fi['page']}] {fi['ocr']}")
+
   top = _rank_snippets(q, pool, k=10, seed=seed, diversify=diversify)
   bundle = {
     "query": q,
     "snippets": [{"idx": s["i"], "text": s["text"]} for s in top],
     "figures": [{"page": f["page"], "caption": f["caption"]} for f in figs_all]
   }
+
   try:
     def _one_variant(bundle, seed_offset=0):
       user = json.dumps(bundle, ensure_ascii=False)
@@ -1316,24 +1876,29 @@ async def diagram_grounded(payload:dict=Body(...)):
         "summary": (res or {}).get("summary") or "",
         "cites": (res or {}).get("cites") or []
       }
+
     variants = []
     for i in range(max(1, n)):
       variants.append(_one_variant(bundle, seed_offset=i))
+
     best = next((v for v in variants if v["mermaid"]), variants[0])
     mer = best["mermaid"]
     summ = best["summary"]
     cites = best["cites"]
+
     ql = (q or "").lower()
     wants_dlp = ("data loss prevention" in ql or "dlp" in ql) and ("saas" in ql)
     describes_flow = ("->" in q) or (" to " in ql and "policy" in ql and ("quarantine" in ql or "allow" in ql))
     if not mer and (wants_dlp or describes_flow):
       mer = _diagram_dlp()
       summ = "(Fallback: dlp_seed) Seeded DLP pipeline rendered due to low-evidence OA results."
+
     if not mer:
       seed_text = " ".join(s.get("text","") for s in bundle["snippets"][:6]) or q
       mer = _skeleton_from_text(seed_text)
     if not _is_plausible_mermaid(mer):
       mer = _default_mermaid()
+
     return JSONResponse({
       "ok": True,
       "mermaid": mer,
@@ -1354,7 +1919,7 @@ async def diagram_grounded(payload:dict=Body(...)):
     return JSONResponse({
       "ok": True,
       "mermaid": mer_fb,
-      "summary": (sum_fb or "Synthesized from model priors."),
+      "summary": "(Fallback: grounded_llm_error) " + (sum_fb or "Synthesized from model priors."),
       "cites": [],
       "snippets": [],
       "figures": [],
